@@ -1,0 +1,259 @@
+from datetime import date, datetime
+from decimal import Decimal
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+from app.db.session import Base
+
+class Tenant(Base):
+    __tablename__ = "tenants"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(180))
+    slug: Mapped[str] = mapped_column(String(120), unique=True)
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    name: Mapped[str] = mapped_column(String(180))
+    email: Mapped[str] = mapped_column(String(220), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(300))
+    role: Mapped[str] = mapped_column(String(40), default="ADMIN")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+class Company(Base):
+    __tablename__ = "companies"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    trade_name: Mapped[str] = mapped_column(String(180))
+    legal_name: Mapped[str] = mapped_column(String(220), default="")
+    cnpj: Mapped[str] = mapped_column(String(14), default="")
+    state_registration: Mapped[str] = mapped_column(String(30), default="")
+    municipal_registration: Mapped[str] = mapped_column(String(30), default="")
+    email: Mapped[str] = mapped_column(String(180), default="")
+    phone: Mapped[str] = mapped_column(String(30), default="")
+    address: Mapped[str] = mapped_column(String(220), default="")
+    number: Mapped[str] = mapped_column(String(30), default="")
+    complement: Mapped[str] = mapped_column(String(120), default="")
+    district: Mapped[str] = mapped_column(String(120), default="")
+    city: Mapped[str] = mapped_column(String(120), default="")
+    state: Mapped[str] = mapped_column(String(2), default="SP")
+    zip_code: Mapped[str] = mapped_column(String(10), default="")
+
+class Product(Base):
+    __tablename__ = "products"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    sku: Mapped[str] = mapped_column(String(80))
+    barcode: Mapped[str] = mapped_column(String(30), default="", index=True)
+    name: Mapped[str] = mapped_column(String(220))
+    category: Mapped[str] = mapped_column(String(100), default="Outros")
+    unit: Mapped[str] = mapped_column(String(20), default="UN")
+    minimum_stock: Mapped[int] = mapped_column(Integer, default=0)
+    unit_cost: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    sale_price: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+
+class StockMovement(Base):
+    __tablename__ = "stock_movements"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    product_id: Mapped[int] = mapped_column(index=True)
+    movement_type: Mapped[str] = mapped_column(String(20))
+    quantity: Mapped[int] = mapped_column(Integer)
+    unit_value: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    document: Mapped[str] = mapped_column(String(100), default="")
+    movement_date: Mapped[date] = mapped_column(Date, default=date.today)
+
+class Sale(Base):
+    __tablename__ = "sales"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    number: Mapped[str] = mapped_column(String(40))
+    customer_name: Mapped[str] = mapped_column(String(220), default="Consumidor final")
+    customer_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    customer_document: Mapped[str] = mapped_column(String(20), default="")
+    customer_person_type: Mapped[str] = mapped_column(String(2), default="PF")
+    customer_state_registration: Mapped[str] = mapped_column(String(30), default="")
+    payment_method: Mapped[str] = mapped_column(String(40), default="PIX")
+    discount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    customer_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    customer_document: Mapped[str] = mapped_column(String(20), default="")
+    customer_person_type: Mapped[str] = mapped_column(String(2), default="PF")
+    payment_method: Mapped[str] = mapped_column(String(40), default="PIX")
+    discount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    total: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    sale_date: Mapped[date] = mapped_column(Date, default=date.today)
+    status: Mapped[str] = mapped_column(String(30), default="CONCLUÍDA")
+
+class Payable(Base):
+    __tablename__ = "payables"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    supplier: Mapped[str] = mapped_column(String(220))
+    due_date: Mapped[date] = mapped_column(Date)
+    value: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    status: Mapped[str] = mapped_column(String(30), default="EM ABERTO")
+
+
+class SaleItem(Base):
+    __tablename__ = "sale_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sale_id: Mapped[int] = mapped_column(ForeignKey("sales.id"), index=True)
+    product_id: Mapped[int] = mapped_column(index=True)
+    quantity: Mapped[int] = mapped_column(Integer)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    total: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+
+
+class Receivable(Base):
+    __tablename__ = "receivables"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    customer: Mapped[str] = mapped_column(String(220), default="Consumidor final")
+    description: Mapped[str] = mapped_column(String(220), default="")
+    due_date: Mapped[date] = mapped_column(Date)
+    value: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    status: Mapped[str] = mapped_column(String(30), default="EM ABERTO")
+    received_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    sale_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class ImportedPdf(Base):
+    __tablename__ = "imported_pdfs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    document_type: Mapped[str] = mapped_column(String(20))
+    filename: Mapped[str] = mapped_column(String(255))
+    stored_path: Mapped[str] = mapped_column(String(500))
+    supplier: Mapped[str] = mapped_column(String(220), default="")
+    supplier_document: Mapped[str] = mapped_column(String(30), default="")
+    document_number: Mapped[str] = mapped_column(String(80), default="")
+    issue_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    total_value: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    barcode: Mapped[str] = mapped_column(String(120), default="")
+    extracted_text: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(30), default="PENDENTE")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class FiscalConfig(Base):
+    __tablename__ = "fiscal_configs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True, unique=True)
+    provider: Mapped[str] = mapped_column(String(60), default="NUVEM_FISCAL")
+    environment: Mapped[str] = mapped_column(String(20), default="HOMOLOGACAO")
+    client_id_encrypted: Mapped[str] = mapped_column(Text, default="")
+    client_secret_encrypted: Mapped[str] = mapped_column(Text, default="")
+    certificate_path: Mapped[str] = mapped_column(String(500), default="")
+    certificate_password_encrypted: Mapped[str] = mapped_column(Text, default="")
+    automatic_issue: Mapped[bool] = mapped_column(Boolean, default=False)
+    series: Mapped[str] = mapped_column(String(10), default="1")
+    last_number: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Customer(Base):
+    __tablename__ = "customers"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    person_type: Mapped[str] = mapped_column(String(2), default="PF")
+    name: Mapped[str] = mapped_column(String(220))
+    trade_name: Mapped[str] = mapped_column(String(220), default="")
+    document: Mapped[str] = mapped_column(String(20), default="", index=True)
+    state_registration: Mapped[str] = mapped_column(String(30), default="")
+    email: Mapped[str] = mapped_column(String(180), default="")
+    phone: Mapped[str] = mapped_column(String(30), default="")
+    zip_code: Mapped[str] = mapped_column(String(10), default="")
+    address: Mapped[str] = mapped_column(String(220), default="")
+    number: Mapped[str] = mapped_column(String(30), default="")
+    complement: Mapped[str] = mapped_column(String(120), default="")
+    district: Mapped[str] = mapped_column(String(120), default="")
+    city: Mapped[str] = mapped_column(String(120), default="")
+    state: Mapped[str] = mapped_column(String(2), default="SP")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Supplier(Base):
+    __tablename__ = "suppliers"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    legal_name: Mapped[str] = mapped_column(String(220))
+    trade_name: Mapped[str] = mapped_column(String(220), default="")
+    cnpj: Mapped[str] = mapped_column(String(14), default="", index=True)
+    state_registration: Mapped[str] = mapped_column(String(30), default="")
+    email: Mapped[str] = mapped_column(String(180), default="")
+    phone: Mapped[str] = mapped_column(String(30), default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class ImportedNfe(Base):
+    __tablename__ = "imported_nfe"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    access_key: Mapped[str] = mapped_column(String(44), unique=True, index=True)
+    invoice_number: Mapped[str] = mapped_column(String(30), default="")
+    series: Mapped[str] = mapped_column(String(10), default="")
+    issue_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    supplier_name: Mapped[str] = mapped_column(String(220), default="")
+    supplier_cnpj: Mapped[str] = mapped_column(String(14), default="")
+    total_value: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    status: Mapped[str] = mapped_column(String(30), default="PENDENTE")
+    filename: Mapped[str] = mapped_column(String(255), default="")
+    stored_path: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ImportedNfeItem(Base):
+    __tablename__ = "imported_nfe_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    nfe_id: Mapped[int] = mapped_column(ForeignKey("imported_nfe.id"), index=True)
+    product_code: Mapped[str] = mapped_column(String(80), default="")
+    barcode: Mapped[str] = mapped_column(String(30), default="")
+    description: Mapped[str] = mapped_column(String(220), default="")
+    ncm: Mapped[str] = mapped_column(String(12), default="")
+    cfop: Mapped[str] = mapped_column(String(10), default="")
+    unit: Mapped[str] = mapped_column(String(20), default="UN")
+    invoiced_quantity: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=0)
+    received_quantity: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=0)
+    unit_value: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=0)
+    total_value: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    matched_product_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class NfeInstallment(Base):
+    __tablename__ = "nfe_installments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    nfe_id: Mapped[int] = mapped_column(ForeignKey("imported_nfe.id"), index=True)
+    installment_number: Mapped[str] = mapped_column(String(30), default="")
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    value: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+
+
+class FiscalDocument(Base):
+    __tablename__ = "fiscal_documents"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    sale_id: Mapped[int] = mapped_column(index=True)
+    document_type: Mapped[str] = mapped_column(String(10), default="NFE")
+    environment: Mapped[str] = mapped_column(String(20), default="HOMOLOGACAO")
+    status: Mapped[str] = mapped_column(String(40), default="PENDENTE")
+    access_key: Mapped[str] = mapped_column(String(44), default="")
+    protocol: Mapped[str] = mapped_column(String(80), default="")
+    xml_path: Mapped[str] = mapped_column(String(500), default="")
+    danfe_path: Mapped[str] = mapped_column(String(500), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
