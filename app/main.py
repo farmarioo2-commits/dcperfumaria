@@ -889,11 +889,34 @@ async def upload_fiscal_certificate(
 
     target = CERT_DIR / f"{user.tenant_id}_{company_id}_{uuid.uuid4().hex}.p12"
     target.write_bytes(await file.read())
+
+    try:
+        from app.services.sefaz_distribution import load_certificate_info
+        info = load_certificate_info(str(target), password)
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, f"Certificado A1 inválido ou senha incorreta: {exc}")
+
+    if info.valid_until < datetime.utcnow():
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, "O certificado A1 está vencido")
+
+    old_path = Path(row.certificate_path) if row.certificate_path else None
     row.certificate_path = str(target)
     row.certificate_password_encrypted = _encrypt_secret(password)
     row.updated_at = datetime.utcnow()
     db.commit()
-    return {"ok": True, "filename": file.filename}
+
+    if old_path and old_path != target:
+        old_path.unlink(missing_ok=True)
+
+    return {
+        "ok": True,
+        "filename": file.filename,
+        "subject": info.subject,
+        "issuer": info.issuer,
+        "valid_until": info.valid_until,
+    }
 
 
 @app.get("/api/fiscal/readiness")
@@ -1487,48 +1510,371 @@ def health():
 # --- Integração SEFAZ / Distribuição DF-e ---
 from app.models import SefazDistributionConfig, SefazDistributionDocument
 from app.services.sefaz_distribution import load_certificate_info, query_distribution, summarize_document
-UF_CODES={"RO":11,"AC":12,"AM":13,"RR":14,"PA":15,"AP":16,"TO":17,"MA":21,"PI":22,"CE":23,"RN":24,"PB":25,"PE":26,"AL":27,"SE":28,"BA":29,"MG":31,"ES":32,"RJ":33,"SP":35,"PR":41,"SC":42,"RS":43,"MS":50,"MT":51,"GO":52,"DF":53}
+from app.services.sefaz_import import import_sefaz_document
+
+UF_CODES = {
+    "RO": 11, "AC": 12, "AM": 13, "RR": 14, "PA": 15, "AP": 16, "TO": 17,
+    "MA": 21, "PI": 22, "CE": 23, "RN": 24, "PB": 25, "PE": 26, "AL": 27,
+    "SE": 28, "BA": 29, "MG": 31, "ES": 32, "RJ": 33, "SP": 35, "PR": 41,
+    "SC": 42, "RS": 43, "MS": 50, "MT": 51, "GO": 52, "DF": 53,
+}
+
+
 class SefazConfigIn(BaseModel):
-    environment:str="PRODUCAO"
-    automatic_import:bool=False
-@app.get('/api/sefaz/config')
-def sefaz_config(company_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    c=db.query(Company).filter(Company.id==company_id,Company.tenant_id==user.tenant_id).first()
-    if not c: raise HTTPException(404,'Empresa não encontrada')
-    x=db.query(SefazDistributionConfig).filter(SefazDistributionConfig.tenant_id==user.tenant_id,SefazDistributionConfig.company_id==company_id).first()
-    f=db.query(FiscalConfig).filter(FiscalConfig.tenant_id==user.tenant_id,FiscalConfig.company_id==company_id).first()
-    return {'environment':x.environment if x else 'PRODUCAO','last_nsu':x.last_nsu if x else '000000000000000','max_nsu':x.max_nsu if x else '000000000000000','automatic_import':x.automatic_import if x else False,'last_query_at':x.last_query_at if x else None,'last_status_code':x.last_status_code if x else '','last_status_message':x.last_status_message if x else '','has_certificate':bool(f and f.certificate_path)}
-@app.put('/api/sefaz/config')
-def sefaz_save(company_id:int,data:SefazConfigIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    x=db.query(SefazDistributionConfig).filter(SefazDistributionConfig.tenant_id==user.tenant_id,SefazDistributionConfig.company_id==company_id).first()
-    if not x: x=SefazDistributionConfig(tenant_id=user.tenant_id,company_id=company_id); db.add(x)
-    x.environment=data.environment.upper(); x.automatic_import=data.automatic_import; x.updated_at=datetime.utcnow(); db.commit(); return {'ok':True}
-@app.get('/api/sefaz/certificate/test')
-def sefaz_cert_test(company_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    f=db.query(FiscalConfig).filter(FiscalConfig.tenant_id==user.tenant_id,FiscalConfig.company_id==company_id).first()
-    if not f or not f.certificate_path: raise HTTPException(400,'Cadastre o certificado A1 primeiro')
-    try: i=load_certificate_info(f.certificate_path,_decrypt_secret(f.certificate_password_encrypted))
-    except Exception as e: raise HTTPException(400,f'Certificado inválido: {e}')
-    return {'ok':True,'subject':i.subject,'issuer':i.issuer,'serial_number':i.serial_number,'valid_from':i.valid_from,'valid_until':i.valid_until,'expired':i.valid_until<datetime.utcnow()}
-@app.post('/api/sefaz/query')
-def sefaz_query(company_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    c=db.query(Company).filter(Company.id==company_id,Company.tenant_id==user.tenant_id).first()
-    if not c: raise HTTPException(404,'Empresa não encontrada')
-    uf=UF_CODES.get((c.state or '').upper())
-    if not uf: raise HTTPException(400,'UF inválida')
-    f=db.query(FiscalConfig).filter(FiscalConfig.tenant_id==user.tenant_id,FiscalConfig.company_id==company_id).first()
-    if not f or not f.certificate_path: raise HTTPException(400,'Cadastre o certificado A1')
-    x=db.query(SefazDistributionConfig).filter(SefazDistributionConfig.tenant_id==user.tenant_id,SefazDistributionConfig.company_id==company_id).first()
-    if not x: x=SefazDistributionConfig(tenant_id=user.tenant_id,company_id=company_id); db.add(x); db.flush()
-    try: r=query_distribution(c.cnpj,uf,x.last_nsu,x.environment,f.certificate_path,_decrypt_secret(f.certificate_password_encrypted))
-    except Exception as e: raise HTTPException(502,f'Falha ao consultar a SEFAZ: {e}')
-    folder=Path(__file__).resolve().parent.parent/'uploads'/'sefaz'/str(user.tenant_id)/str(company_id); folder.mkdir(parents=True,exist_ok=True); saved=0
-    for d in r['documents']:
-        if db.query(SefazDistributionDocument).filter(SefazDistributionDocument.company_id==company_id,SefazDistributionDocument.nsu==d['nsu']).first(): continue
-        z=summarize_document(d['xml']); path=folder/f"{d['nsu']}_{uuid.uuid4().hex}.xml"; path.write_bytes(d['xml'])
-        db.add(SefazDistributionDocument(tenant_id=user.tenant_id,company_id=company_id,nsu=d['nsu'],schema_name=d['schema'],access_key=z['access_key'],document_type=z['document_type'],issuer_name=z['issuer_name'],issuer_document=z['issuer_document'],issue_date=z['issue_date'],total_value=z['total_value'],xml_path=str(path))); saved+=1
-    x.last_nsu=r['last_nsu']; x.max_nsu=r['max_nsu']; x.last_query_at=datetime.utcnow(); x.last_status_code=r['status_code']; x.last_status_message=r['status_message']; db.commit()
-    return {'ok':True,'documents_saved':saved,**{k:r[k] for k in ['status_code','status_message','last_nsu','max_nsu']}}
-@app.get('/api/sefaz/documents')
-def sefaz_documents(company_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    return db.query(SefazDistributionDocument).filter(SefazDistributionDocument.tenant_id==user.tenant_id,SefazDistributionDocument.company_id==company_id).order_by(SefazDistributionDocument.id.desc()).limit(200).all()
+    environment: str = "PRODUCAO"
+    automatic_import: bool = False
+
+
+@app.get("/api/sefaz/config")
+def sefaz_config(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    company = db.query(Company).filter(
+        Company.id == company_id,
+        Company.tenant_id == user.tenant_id,
+    ).first()
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+
+    config = db.query(SefazDistributionConfig).filter(
+        SefazDistributionConfig.tenant_id == user.tenant_id,
+        SefazDistributionConfig.company_id == company_id,
+    ).first()
+    fiscal = db.query(FiscalConfig).filter(
+        FiscalConfig.tenant_id == user.tenant_id,
+        FiscalConfig.company_id == company_id,
+    ).first()
+
+    pending = db.query(func.count(SefazDistributionDocument.id)).filter(
+        SefazDistributionDocument.tenant_id == user.tenant_id,
+        SefazDistributionDocument.company_id == company_id,
+        SefazDistributionDocument.status.in_(["RECEBIDO", "AGUARDANDO_MANIFESTACAO"]),
+    ).scalar() or 0
+    imported = db.query(func.count(SefazDistributionDocument.id)).filter(
+        SefazDistributionDocument.tenant_id == user.tenant_id,
+        SefazDistributionDocument.company_id == company_id,
+        SefazDistributionDocument.status.in_(["IMPORTADO", "DUPLICADA"]),
+    ).scalar() or 0
+
+    return {
+        "environment": config.environment if config else "PRODUCAO",
+        "last_nsu": config.last_nsu if config else "000000000000000",
+        "max_nsu": config.max_nsu if config else "000000000000000",
+        "automatic_import": config.automatic_import if config else False,
+        "last_query_at": config.last_query_at if config else None,
+        "last_status_code": config.last_status_code if config else "",
+        "last_status_message": config.last_status_message if config else "",
+        "has_certificate": bool(fiscal and fiscal.certificate_path),
+        "company_cnpj": company.cnpj,
+        "company_state": company.state,
+        "pending_documents": int(pending),
+        "imported_documents": int(imported),
+    }
+
+
+@app.put("/api/sefaz/config")
+def sefaz_save(
+    company_id: int,
+    data: SefazConfigIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    environment = data.environment.upper()
+    if environment not in {"PRODUCAO", "HOMOLOGACAO"}:
+        raise HTTPException(400, "Ambiente inválido")
+
+    company = db.query(Company).filter(
+        Company.id == company_id,
+        Company.tenant_id == user.tenant_id,
+    ).first()
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+
+    config = db.query(SefazDistributionConfig).filter(
+        SefazDistributionConfig.tenant_id == user.tenant_id,
+        SefazDistributionConfig.company_id == company_id,
+    ).first()
+    if not config:
+        config = SefazDistributionConfig(
+            tenant_id=user.tenant_id,
+            company_id=company_id,
+        )
+        db.add(config)
+
+    config.environment = environment
+    config.automatic_import = data.automatic_import
+    config.updated_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/sefaz/certificate/test")
+def sefaz_cert_test(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    company = db.query(Company).filter(
+        Company.id == company_id,
+        Company.tenant_id == user.tenant_id,
+    ).first()
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+
+    fiscal = db.query(FiscalConfig).filter(
+        FiscalConfig.tenant_id == user.tenant_id,
+        FiscalConfig.company_id == company_id,
+    ).first()
+    if not fiscal or not fiscal.certificate_path:
+        raise HTTPException(400, "Cadastre o certificado A1 primeiro")
+
+    try:
+        info = load_certificate_info(
+            fiscal.certificate_path,
+            _decrypt_secret(fiscal.certificate_password_encrypted),
+        )
+    except Exception as exc:
+        raise HTTPException(400, f"Certificado inválido: {exc}")
+
+    subject_digits = re.sub(r"\D", "", info.subject)
+    company_cnpj = re.sub(r"\D", "", company.cnpj or "")
+    cnpj_matches = not company_cnpj or company_cnpj in subject_digits
+    expired = info.valid_until < datetime.utcnow()
+
+    return {
+        "ok": not expired,
+        "subject": info.subject,
+        "issuer": info.issuer,
+        "serial_number": info.serial_number,
+        "valid_from": info.valid_from,
+        "valid_until": info.valid_until,
+        "expired": expired,
+        "cnpj_matches": cnpj_matches,
+        "company_cnpj": company_cnpj,
+    }
+
+
+def _document_payload(row: SefazDistributionDocument) -> dict:
+    return {
+        "id": row.id,
+        "nsu": row.nsu,
+        "schema_name": row.schema_name,
+        "access_key": row.access_key,
+        "document_type": row.document_type,
+        "issuer_name": row.issuer_name,
+        "issuer_document": row.issuer_document,
+        "issue_date": row.issue_date,
+        "total_value": float(row.total_value or 0),
+        "status": row.status,
+        "created_at": row.created_at,
+    }
+
+
+@app.post("/api/sefaz/query")
+def sefaz_query(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    company = db.query(Company).filter(
+        Company.id == company_id,
+        Company.tenant_id == user.tenant_id,
+    ).first()
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+    if len(re.sub(r"\D", "", company.cnpj or "")) != 14:
+        raise HTTPException(400, "Cadastre um CNPJ válido na empresa")
+
+    uf_code = UF_CODES.get((company.state or "").upper())
+    if not uf_code:
+        raise HTTPException(400, "Cadastre uma UF válida na empresa")
+
+    fiscal = db.query(FiscalConfig).filter(
+        FiscalConfig.tenant_id == user.tenant_id,
+        FiscalConfig.company_id == company_id,
+    ).first()
+    if not fiscal or not fiscal.certificate_path:
+        raise HTTPException(400, "Cadastre o certificado A1")
+
+    config = db.query(SefazDistributionConfig).filter(
+        SefazDistributionConfig.tenant_id == user.tenant_id,
+        SefazDistributionConfig.company_id == company_id,
+    ).first()
+    if not config:
+        config = SefazDistributionConfig(
+            tenant_id=user.tenant_id,
+            company_id=company_id,
+        )
+        db.add(config)
+        db.flush()
+
+    try:
+        result = query_distribution(
+            company.cnpj,
+            uf_code,
+            config.last_nsu,
+            config.environment,
+            fiscal.certificate_path,
+            _decrypt_secret(fiscal.certificate_password_encrypted),
+        )
+    except Exception as exc:
+        config.last_query_at = datetime.utcnow()
+        config.last_status_code = "ERRO"
+        config.last_status_message = str(exc)[:500]
+        db.commit()
+        raise HTTPException(502, f"Falha ao consultar a SEFAZ: {exc}")
+
+    folder = (
+        Path(__file__).resolve().parent.parent
+        / "uploads"
+        / "sefaz"
+        / str(user.tenant_id)
+        / str(company_id)
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+
+    saved_rows: list[SefazDistributionDocument] = []
+    for item in result["documents"]:
+        existing = db.query(SefazDistributionDocument).filter(
+            SefazDistributionDocument.tenant_id == user.tenant_id,
+            SefazDistributionDocument.company_id == company_id,
+            SefazDistributionDocument.nsu == item["nsu"],
+        ).first()
+        if existing:
+            continue
+
+        summary = summarize_document(item["xml"])
+        path = folder / f"{item['nsu']}_{uuid.uuid4().hex}.xml"
+        path.write_bytes(item["xml"])
+        is_summary = summary["document_type"] == "RESNFE"
+        row = SefazDistributionDocument(
+            tenant_id=user.tenant_id,
+            company_id=company_id,
+            nsu=item["nsu"],
+            schema_name=item["schema"],
+            access_key=summary["access_key"],
+            document_type=summary["document_type"],
+            issuer_name=summary["issuer_name"],
+            issuer_document=summary["issuer_document"],
+            issue_date=summary["issue_date"],
+            total_value=summary["total_value"],
+            xml_path=str(path),
+            status="AGUARDANDO_MANIFESTACAO" if is_summary else "RECEBIDO",
+        )
+        db.add(row)
+        db.flush()
+        saved_rows.append(row)
+
+    config.last_nsu = result["last_nsu"]
+    config.max_nsu = result["max_nsu"]
+    config.last_query_at = datetime.utcnow()
+    config.last_status_code = result["status_code"]
+    config.last_status_message = result["status_message"]
+    db.commit()
+
+    imported = 0
+    import_errors = 0
+    if config.automatic_import:
+        for row in saved_rows:
+            if row.status != "RECEBIDO":
+                continue
+            try:
+                output = import_sefaz_document(
+                    db, row, user.tenant_id, company_id
+                )
+                if output.get("ok"):
+                    imported += 1
+            except Exception:
+                db.rollback()
+                row = db.query(SefazDistributionDocument).filter(
+                    SefazDistributionDocument.id == row.id
+                ).first()
+                if row:
+                    row.status = "ERRO"
+                    db.commit()
+                import_errors += 1
+
+    return {
+        "ok": True,
+        "documents_saved": len(saved_rows),
+        "documents_imported": imported,
+        "import_errors": import_errors,
+        "status_code": result["status_code"],
+        "status_message": result["status_message"],
+        "last_nsu": result["last_nsu"],
+        "max_nsu": result["max_nsu"],
+    }
+
+
+@app.get("/api/sefaz/documents")
+def sefaz_documents(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(SefazDistributionDocument).filter(
+        SefazDistributionDocument.tenant_id == user.tenant_id,
+        SefazDistributionDocument.company_id == company_id,
+    ).order_by(SefazDistributionDocument.id.desc()).limit(500).all()
+    return [_document_payload(row) for row in rows]
+
+
+@app.post("/api/sefaz/documents/{document_id}/import")
+def sefaz_import_one(
+    document_id: int,
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    row = db.query(SefazDistributionDocument).filter(
+        SefazDistributionDocument.id == document_id,
+        SefazDistributionDocument.tenant_id == user.tenant_id,
+        SefazDistributionDocument.company_id == company_id,
+    ).first()
+    if not row:
+        raise HTTPException(404, "Documento da SEFAZ não encontrado")
+    try:
+        return import_sefaz_document(db, row, user.tenant_id, company_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(500, f"Falha ao importar NF-e: {exc}")
+
+
+@app.post("/api/sefaz/import-all")
+def sefaz_import_all(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(SefazDistributionDocument).filter(
+        SefazDistributionDocument.tenant_id == user.tenant_id,
+        SefazDistributionDocument.company_id == company_id,
+        SefazDistributionDocument.status == "RECEBIDO",
+    ).order_by(SefazDistributionDocument.id.asc()).all()
+
+    imported = 0
+    duplicates = 0
+    errors: list[dict] = []
+    for row in rows:
+        try:
+            output = import_sefaz_document(db, row, user.tenant_id, company_id)
+            if output.get("duplicate"):
+                duplicates += 1
+            elif output.get("ok"):
+                imported += 1
+        except Exception as exc:
+            db.rollback()
+            errors.append({"document_id": row.id, "error": str(exc)})
+
+    return {
+        "ok": True,
+        "processed": len(rows),
+        "imported": imported,
+        "duplicates": duplicates,
+        "errors": errors,
+    }
+
