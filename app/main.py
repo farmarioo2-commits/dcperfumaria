@@ -17,7 +17,8 @@ import xml.etree.ElementTree as ET
 
 from app.core.security import create_token, decode_token, hash_password, verify_password
 from app.db.session import Base, engine, get_db
-from app.models import Company, Customer, FiscalConfig, FiscalDocument, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, User
+from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, User
+from app.services.gmail_nfe_import import gmail_is_configured, sync_once
 
 Base.metadata.create_all(bind=engine)
 
@@ -1387,6 +1388,41 @@ def list_fiscal_documents(
         for row in rows
     ]
 
+
+@app.get("/api/gmail/status")
+def gmail_status(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    company_ids = [row.id for row in db.query(Company).filter(Company.tenant_id == user.tenant_id).all()]
+    logs = db.query(GmailImportLog).filter(
+        (GmailImportLog.tenant_id == user.tenant_id) |
+        (GmailImportLog.company_id.in_(company_ids) if company_ids else False)
+    ).order_by(GmailImportLog.processed_at.desc()).limit(50).all()
+    return {
+        "configured": gmail_is_configured(),
+        "automatic_interval": "5 minutos (quando o Cron estiver ativo)",
+        "logs": [{
+            "id": row.id,
+            "sender": row.sender,
+            "subject": row.subject,
+            "filename": row.filename,
+            "access_key": row.access_key,
+            "status": row.status,
+            "detail": row.detail,
+            "processed_at": row.processed_at,
+        } for row in logs],
+    }
+
+
+@app.post("/api/gmail/sync")
+def gmail_sync(user: User = Depends(current_user)):
+    if user.role != "ADMIN":
+        raise HTTPException(403, "Somente administradores podem executar a importação.")
+    if not gmail_is_configured():
+        raise HTTPException(400, "Gmail ainda não configurado no Railway.")
+    try:
+        return sync_once()
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
 @app.get("/api/dashboard")
 def dashboard(company_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     today = date.today()
@@ -1447,3 +1483,52 @@ def dashboard(company_id: int, db: Session = Depends(get_db), user: User = Depen
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# --- Integração SEFAZ / Distribuição DF-e ---
+from app.models import SefazDistributionConfig, SefazDistributionDocument
+from app.services.sefaz_distribution import load_certificate_info, query_distribution, summarize_document
+UF_CODES={"RO":11,"AC":12,"AM":13,"RR":14,"PA":15,"AP":16,"TO":17,"MA":21,"PI":22,"CE":23,"RN":24,"PB":25,"PE":26,"AL":27,"SE":28,"BA":29,"MG":31,"ES":32,"RJ":33,"SP":35,"PR":41,"SC":42,"RS":43,"MS":50,"MT":51,"GO":52,"DF":53}
+class SefazConfigIn(BaseModel):
+    environment:str="PRODUCAO"
+    automatic_import:bool=False
+@app.get('/api/sefaz/config')
+def sefaz_config(company_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    c=db.query(Company).filter(Company.id==company_id,Company.tenant_id==user.tenant_id).first()
+    if not c: raise HTTPException(404,'Empresa não encontrada')
+    x=db.query(SefazDistributionConfig).filter(SefazDistributionConfig.tenant_id==user.tenant_id,SefazDistributionConfig.company_id==company_id).first()
+    f=db.query(FiscalConfig).filter(FiscalConfig.tenant_id==user.tenant_id,FiscalConfig.company_id==company_id).first()
+    return {'environment':x.environment if x else 'PRODUCAO','last_nsu':x.last_nsu if x else '000000000000000','max_nsu':x.max_nsu if x else '000000000000000','automatic_import':x.automatic_import if x else False,'last_query_at':x.last_query_at if x else None,'last_status_code':x.last_status_code if x else '','last_status_message':x.last_status_message if x else '','has_certificate':bool(f and f.certificate_path)}
+@app.put('/api/sefaz/config')
+def sefaz_save(company_id:int,data:SefazConfigIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    x=db.query(SefazDistributionConfig).filter(SefazDistributionConfig.tenant_id==user.tenant_id,SefazDistributionConfig.company_id==company_id).first()
+    if not x: x=SefazDistributionConfig(tenant_id=user.tenant_id,company_id=company_id); db.add(x)
+    x.environment=data.environment.upper(); x.automatic_import=data.automatic_import; x.updated_at=datetime.utcnow(); db.commit(); return {'ok':True}
+@app.get('/api/sefaz/certificate/test')
+def sefaz_cert_test(company_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    f=db.query(FiscalConfig).filter(FiscalConfig.tenant_id==user.tenant_id,FiscalConfig.company_id==company_id).first()
+    if not f or not f.certificate_path: raise HTTPException(400,'Cadastre o certificado A1 primeiro')
+    try: i=load_certificate_info(f.certificate_path,_decrypt_secret(f.certificate_password_encrypted))
+    except Exception as e: raise HTTPException(400,f'Certificado inválido: {e}')
+    return {'ok':True,'subject':i.subject,'issuer':i.issuer,'serial_number':i.serial_number,'valid_from':i.valid_from,'valid_until':i.valid_until,'expired':i.valid_until<datetime.utcnow()}
+@app.post('/api/sefaz/query')
+def sefaz_query(company_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    c=db.query(Company).filter(Company.id==company_id,Company.tenant_id==user.tenant_id).first()
+    if not c: raise HTTPException(404,'Empresa não encontrada')
+    uf=UF_CODES.get((c.state or '').upper())
+    if not uf: raise HTTPException(400,'UF inválida')
+    f=db.query(FiscalConfig).filter(FiscalConfig.tenant_id==user.tenant_id,FiscalConfig.company_id==company_id).first()
+    if not f or not f.certificate_path: raise HTTPException(400,'Cadastre o certificado A1')
+    x=db.query(SefazDistributionConfig).filter(SefazDistributionConfig.tenant_id==user.tenant_id,SefazDistributionConfig.company_id==company_id).first()
+    if not x: x=SefazDistributionConfig(tenant_id=user.tenant_id,company_id=company_id); db.add(x); db.flush()
+    try: r=query_distribution(c.cnpj,uf,x.last_nsu,x.environment,f.certificate_path,_decrypt_secret(f.certificate_password_encrypted))
+    except Exception as e: raise HTTPException(502,f'Falha ao consultar a SEFAZ: {e}')
+    folder=Path(__file__).resolve().parent.parent/'uploads'/'sefaz'/str(user.tenant_id)/str(company_id); folder.mkdir(parents=True,exist_ok=True); saved=0
+    for d in r['documents']:
+        if db.query(SefazDistributionDocument).filter(SefazDistributionDocument.company_id==company_id,SefazDistributionDocument.nsu==d['nsu']).first(): continue
+        z=summarize_document(d['xml']); path=folder/f"{d['nsu']}_{uuid.uuid4().hex}.xml"; path.write_bytes(d['xml'])
+        db.add(SefazDistributionDocument(tenant_id=user.tenant_id,company_id=company_id,nsu=d['nsu'],schema_name=d['schema'],access_key=z['access_key'],document_type=z['document_type'],issuer_name=z['issuer_name'],issuer_document=z['issuer_document'],issue_date=z['issue_date'],total_value=z['total_value'],xml_path=str(path))); saved+=1
+    x.last_nsu=r['last_nsu']; x.max_nsu=r['max_nsu']; x.last_query_at=datetime.utcnow(); x.last_status_code=r['status_code']; x.last_status_message=r['status_message']; db.commit()
+    return {'ok':True,'documents_saved':saved,**{k:r[k] for k in ['status_code','status_message','last_nsu','max_nsu']}}
+@app.get('/api/sefaz/documents')
+def sefaz_documents(company_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    return db.query(SefazDistributionDocument).filter(SefazDistributionDocument.tenant_id==user.tenant_id,SefazDistributionDocument.company_id==company_id).order_by(SefazDistributionDocument.id.desc()).limit(200).all()
