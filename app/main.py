@@ -1,8 +1,9 @@
 import re
 import uuid
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from datetime import date
+from threading import Lock
 from decimal import Decimal
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +18,8 @@ import xml.etree.ElementTree as ET
 
 from app.core.security import create_token, decode_token, hash_password, verify_password
 from app.db.session import Base, engine, get_db
-from app.models import Company, Customer, FiscalConfig, FiscalDocument, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, User
+from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, User
+from app.services.gmail_nfe_import import gmail_is_configured, sync_once
 
 Base.metadata.create_all(bind=engine)
 
@@ -30,6 +32,33 @@ app.add_middleware(
 )
 
 security = HTTPBearer()
+
+# Impede duas consultas simultâneas do mesmo CNPJ nesta instância.
+_sefaz_query_locks: dict[tuple[int, int], Lock] = {}
+_sefaz_query_locks_guard = Lock()
+_SEFAZ_COOLDOWN = timedelta(hours=1)
+
+def _sefaz_lock(tenant_id: int, company_id: int) -> Lock:
+    key = (tenant_id, company_id)
+    with _sefaz_query_locks_guard:
+        return _sefaz_query_locks.setdefault(key, Lock())
+
+def _normalized_nsu(value: str | None) -> str:
+    digits = re.sub(r"\D", "", value or "")[-15:]
+    return digits.zfill(15)
+
+def _remaining_sefaz_cooldown(config: "SefazDistributionConfig", now: datetime) -> int:
+    if not config.last_query_at:
+        return 0
+    last_nsu = _normalized_nsu(config.last_nsu)
+    max_nsu = _normalized_nsu(config.max_nsu)
+    must_wait = config.last_status_code in {"137", "656"}
+    if max_nsu != "000000000000000" and last_nsu == max_nsu:
+        must_wait = True
+    if not must_wait:
+        return 0
+    elapsed = now - config.last_query_at
+    return max(0, int((_SEFAZ_COOLDOWN - elapsed).total_seconds()))
 
 class RegisterIn(BaseModel):
     company_name: str
@@ -1411,6 +1440,40 @@ def list_fiscal_documents(
     ]
 
 
+@app.get("/api/gmail/status")
+def gmail_status(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    company_ids = [row.id for row in db.query(Company).filter(Company.tenant_id == user.tenant_id).all()]
+    logs = db.query(GmailImportLog).filter(
+        (GmailImportLog.tenant_id == user.tenant_id) |
+        (GmailImportLog.company_id.in_(company_ids) if company_ids else False)
+    ).order_by(GmailImportLog.processed_at.desc()).limit(50).all()
+    return {
+        "configured": gmail_is_configured(),
+        "automatic_interval": "5 minutos (quando o Cron estiver ativo)",
+        "logs": [{
+            "id": row.id,
+            "sender": row.sender,
+            "subject": row.subject,
+            "filename": row.filename,
+            "access_key": row.access_key,
+            "status": row.status,
+            "detail": row.detail,
+            "processed_at": row.processed_at,
+        } for row in logs],
+    }
+
+
+@app.post("/api/gmail/sync")
+def gmail_sync(user: User = Depends(current_user)):
+    if user.role != "ADMIN":
+        raise HTTPException(403, "Somente administradores podem executar a importação.")
+    if not gmail_is_configured():
+        raise HTTPException(400, "Gmail ainda não configurado no Railway.")
+    try:
+        return sync_once()
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
 @app.get("/api/dashboard")
 def dashboard(company_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     today = date.today()
@@ -1474,7 +1537,7 @@ def health():
 
 # --- Integração SEFAZ / Distribuição DF-e ---
 from app.models import SefazDistributionConfig, SefazDistributionDocument
-from app.services.sefaz_distribution import load_certificate_info, query_distribution, summarize_document
+from app.services.sefaz_distribution import load_certificate_info, query_distribution, query_by_access_key, summarize_document
 from app.services.sefaz_import import import_sefaz_document
 
 UF_CODES = {
@@ -1488,6 +1551,10 @@ UF_CODES = {
 class SefazConfigIn(BaseModel):
     environment: str = "PRODUCAO"
     automatic_import: bool = False
+
+
+class SefazAccessKeyIn(BaseModel):
+    access_key: str
 
 
 @app.get("/api/sefaz/config")
@@ -1531,6 +1598,14 @@ def sefaz_config(
         "last_query_at": config.last_query_at if config else None,
         "last_status_code": config.last_status_code if config else "",
         "last_status_message": config.last_status_message if config else "",
+        "cooldown_seconds": (
+            _remaining_sefaz_cooldown(config, datetime.utcnow()) if config else 0
+        ),
+        "next_query_at": (
+            config.last_query_at + _SEFAZ_COOLDOWN
+            if config and _remaining_sefaz_cooldown(config, datetime.utcnow()) > 0
+            else None
+        ),
         "has_certificate": bool(fiscal and fiscal.certificate_path),
         "company_cnpj": company.cnpj,
         "company_state": company.state,
@@ -1675,21 +1750,197 @@ def sefaz_query(
         db.add(config)
         db.flush()
 
+    query_lock = _sefaz_lock(user.tenant_id, company_id)
+    if not query_lock.acquire(blocking=False):
+        raise HTTPException(409, "Já existe uma consulta à SEFAZ em andamento para esta empresa")
+
     try:
-        result = query_distribution(
+        now = datetime.utcnow()
+        remaining = _remaining_sefaz_cooldown(config, now)
+        if remaining > 0:
+            minutes = max(1, (remaining + 59) // 60)
+            raise HTTPException(
+                429,
+                f"A SEFAZ exige intervalo antes de uma nova consulta. Aguarde aproximadamente {minutes} minuto(s).",
+            )
+
+        sent_nsu = _normalized_nsu(config.last_nsu)
+        try:
+            result = query_distribution(
+                company.cnpj,
+                uf_code,
+                sent_nsu,
+                config.environment,
+                fiscal.certificate_path,
+                _decrypt_secret(fiscal.certificate_password_encrypted),
+            )
+        except Exception as exc:
+            config.last_query_at = now
+            config.last_status_code = "ERRO"
+            config.last_status_message = str(exc)[:500]
+            db.commit()
+            raise HTTPException(502, f"Falha ao consultar a SEFAZ: {exc}")
+
+        status_code = str(result.get("status_code", ""))
+        status_message = str(result.get("status_message", ""))
+
+        # O cStat 656 não deve alterar o NSU persistido. Alterá-lo faria a
+        # próxima solicitação usar um valor diferente do último NSU válido.
+        if status_code == "656":
+            config.last_query_at = now
+            config.last_status_code = status_code
+            config.last_status_message = status_message[:500]
+            db.commit()
+            raise HTTPException(
+                429,
+                "SEFAZ 656 - Consumo indevido. O NSU válido foi preservado; aguarde 1 hora antes de consultar novamente.",
+            )
+
+        folder = (
+            Path(__file__).resolve().parent.parent
+            / "uploads"
+            / "sefaz"
+            / str(user.tenant_id)
+            / str(company_id)
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+
+        saved_rows: list[SefazDistributionDocument] = []
+        for item in result["documents"]:
+            existing = db.query(SefazDistributionDocument).filter(
+                SefazDistributionDocument.tenant_id == user.tenant_id,
+                SefazDistributionDocument.company_id == company_id,
+                SefazDistributionDocument.nsu == item["nsu"],
+            ).first()
+            if existing:
+                continue
+
+            summary = summarize_document(item["xml"])
+            path = folder / f"{item['nsu']}_{uuid.uuid4().hex}.xml"
+            path.write_bytes(item["xml"])
+            is_summary = summary["document_type"] == "RESNFE"
+            row = SefazDistributionDocument(
+                tenant_id=user.tenant_id,
+                company_id=company_id,
+                nsu=item["nsu"],
+                schema_name=item["schema"],
+                access_key=summary["access_key"],
+                document_type=summary["document_type"],
+                issuer_name=summary["issuer_name"],
+                issuer_document=summary["issuer_document"],
+                issue_date=summary["issue_date"],
+                total_value=summary["total_value"],
+                xml_path=str(path),
+                status="AGUARDANDO_MANIFESTACAO" if is_summary else "RECEBIDO",
+            )
+            db.add(row)
+            db.flush()
+            saved_rows.append(row)
+
+        returned_last = _normalized_nsu(result.get("last_nsu"))
+        returned_max = _normalized_nsu(result.get("max_nsu"))
+        current_last = _normalized_nsu(config.last_nsu)
+        current_max = _normalized_nsu(config.max_nsu)
+
+        # Nunca retrocede nem zera o NSU por causa de resposta incompleta.
+        if status_code in {"137", "138"}:
+            if int(returned_last) >= int(current_last):
+                config.last_nsu = returned_last
+            if returned_max != "000000000000000" and int(returned_max) >= int(current_max):
+                config.max_nsu = returned_max
+
+        config.last_query_at = now
+        config.last_status_code = status_code
+        config.last_status_message = status_message[:500]
+        db.commit()
+
+        imported = 0
+        import_errors = 0
+        if config.automatic_import:
+            for row in saved_rows:
+                if row.status != "RECEBIDO":
+                    continue
+                try:
+                    output = import_sefaz_document(
+                        db, row, user.tenant_id, company_id
+                    )
+                    if output.get("ok"):
+                        imported += 1
+                except Exception:
+                    db.rollback()
+                    current_row = db.query(SefazDistributionDocument).filter(
+                        SefazDistributionDocument.id == row.id
+                    ).first()
+                    if current_row:
+                        current_row.status = "ERRO"
+                        db.commit()
+                    import_errors += 1
+
+        return {
+            "ok": True,
+            "documents_saved": len(saved_rows),
+            "documents_imported": imported,
+            "import_errors": import_errors,
+            "status_code": status_code,
+            "status_message": status_message,
+            "last_nsu": config.last_nsu,
+            "max_nsu": config.max_nsu,
+            "next_query_after_seconds": (
+                3600 if status_code == "137" or config.last_nsu == config.max_nsu else 0
+            ),
+            "sent_nsu": sent_nsu,
+        }
+    finally:
+        query_lock.release()
+
+
+
+@app.post("/api/sefaz/query-key")
+def sefaz_query_key(
+    company_id: int,
+    data: SefazAccessKeyIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    company = db.query(Company).filter(
+        Company.id == company_id,
+        Company.tenant_id == user.tenant_id,
+    ).first()
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+
+    access_key = re.sub(r"\D", "", data.access_key or "")
+    if len(access_key) != 44:
+        raise HTTPException(400, "A chave de acesso deve conter 44 números")
+
+    uf_code = UF_CODES.get((company.state or "").upper())
+    if not uf_code:
+        raise HTTPException(400, "Cadastre uma UF válida na empresa")
+
+    fiscal = db.query(FiscalConfig).filter(
+        FiscalConfig.tenant_id == user.tenant_id,
+        FiscalConfig.company_id == company_id,
+    ).first()
+    if not fiscal or not fiscal.certificate_path:
+        raise HTTPException(400, "Cadastre o certificado A1")
+
+    config = db.query(SefazDistributionConfig).filter(
+        SefazDistributionConfig.tenant_id == user.tenant_id,
+        SefazDistributionConfig.company_id == company_id,
+    ).first()
+    environment = config.environment if config else "PRODUCAO"
+
+    try:
+        result = query_by_access_key(
             company.cnpj,
             uf_code,
-            config.last_nsu,
-            config.environment,
+            access_key,
+            environment,
             fiscal.certificate_path,
             _decrypt_secret(fiscal.certificate_password_encrypted),
         )
     except Exception as exc:
-        config.last_query_at = datetime.utcnow()
-        config.last_status_code = "ERRO"
-        config.last_status_message = str(exc)[:500]
-        db.commit()
-        raise HTTPException(502, f"Falha ao consultar a SEFAZ: {exc}")
+        raise HTTPException(502, f"Falha ao consultar a chave na SEFAZ: {exc}")
 
     folder = (
         Path(__file__).resolve().parent.parent
@@ -1700,18 +1951,23 @@ def sefaz_query(
     )
     folder.mkdir(parents=True, exist_ok=True)
 
-    saved_rows: list[SefazDistributionDocument] = []
+    saved = []
     for item in result["documents"]:
+        summary = summarize_document(item["xml"])
         existing = db.query(SefazDistributionDocument).filter(
             SefazDistributionDocument.tenant_id == user.tenant_id,
             SefazDistributionDocument.company_id == company_id,
-            SefazDistributionDocument.nsu == item["nsu"],
+            (
+                (SefazDistributionDocument.access_key == summary["access_key"])
+                if summary["access_key"]
+                else (SefazDistributionDocument.nsu == item["nsu"])
+            ),
         ).first()
         if existing:
+            saved.append(existing)
             continue
 
-        summary = summarize_document(item["xml"])
-        path = folder / f"{item['nsu']}_{uuid.uuid4().hex}.xml"
+        path = folder / f"{item['nsu'] or 'chave'}_{uuid.uuid4().hex}.xml"
         path.write_bytes(item["xml"])
         is_summary = summary["document_type"] == "RESNFE"
         row = SefazDistributionDocument(
@@ -1719,7 +1975,7 @@ def sefaz_query(
             company_id=company_id,
             nsu=item["nsu"],
             schema_name=item["schema"],
-            access_key=summary["access_key"],
+            access_key=summary["access_key"] or access_key,
             document_type=summary["document_type"],
             issuer_name=summary["issuer_name"],
             issuer_document=summary["issuer_document"],
@@ -1730,46 +1986,23 @@ def sefaz_query(
         )
         db.add(row)
         db.flush()
-        saved_rows.append(row)
-
-    config.last_nsu = result["last_nsu"]
-    config.max_nsu = result["max_nsu"]
-    config.last_query_at = datetime.utcnow()
-    config.last_status_code = result["status_code"]
-    config.last_status_message = result["status_message"]
+        saved.append(row)
     db.commit()
 
-    imported = 0
-    import_errors = 0
-    if config.automatic_import:
-        for row in saved_rows:
-            if row.status != "RECEBIDO":
-                continue
-            try:
-                output = import_sefaz_document(
-                    db, row, user.tenant_id, company_id
-                )
-                if output.get("ok"):
-                    imported += 1
-            except Exception:
-                db.rollback()
-                row = db.query(SefazDistributionDocument).filter(
-                    SefazDistributionDocument.id == row.id
-                ).first()
-                if row:
-                    row.status = "ERRO"
-                    db.commit()
-                import_errors += 1
+    detail = ""
+    if result["status_code"] == "137":
+        detail = (
+            "A SEFAZ não disponibilizou essa chave para este CNPJ/certificado. "
+            "Quando o primeiro uso do serviço ocorre depois da emissão, o Ambiente Nacional "
+            "pode não gerar NSU retroativo; nesse caso importe o XML recebido do fornecedor."
+        )
 
     return {
         "ok": True,
-        "documents_saved": len(saved_rows),
-        "documents_imported": imported,
-        "import_errors": import_errors,
         "status_code": result["status_code"],
         "status_message": result["status_message"],
-        "last_nsu": result["last_nsu"],
-        "max_nsu": result["max_nsu"],
+        "documents_saved": len(saved),
+        "detail": detail,
     }
 
 
