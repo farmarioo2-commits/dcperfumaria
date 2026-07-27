@@ -257,3 +257,50 @@ class FiscalDocument(Base):
     danfe_path: Mapped[str] = mapped_column(String(500), default="")
     error_message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class GmailImportLog(Base):
+    __tablename__ = "gmail_import_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    gmail_message_id: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    gmail_thread_id: Mapped[str] = mapped_column(String(160), default="")
+    tenant_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    company_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    sender: Mapped[str] = mapped_column(String(300), default="")
+    subject: Mapped[str] = mapped_column(String(500), default="")
+    filename: Mapped[str] = mapped_column(String(500), default="")
+    access_key: Mapped[str] = mapped_column(String(44), default="", index=True)
+    status: Mapped[str] = mapped_column(String(30), default="PENDENTE", index=True)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    processed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SefazDistributionConfig(Base):
+    __tablename__="sefaz_distribution_configs"
+    id: Mapped[int]=mapped_column(primary_key=True)
+    tenant_id: Mapped[int]=mapped_column(index=True)
+    company_id: Mapped[int]=mapped_column(index=True,unique=True)
+    environment: Mapped[str]=mapped_column(String(20),default="PRODUCAO")
+    last_nsu: Mapped[str]=mapped_column(String(15),default="000000000000000")
+    max_nsu: Mapped[str]=mapped_column(String(15),default="000000000000000")
+    automatic_import: Mapped[bool]=mapped_column(Boolean,default=False)
+    last_query_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True)
+    last_status_code: Mapped[str]=mapped_column(String(10),default="")
+    last_status_message: Mapped[str]=mapped_column(String(500),default="")
+    updated_at: Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+class SefazDistributionDocument(Base):
+    __tablename__="sefaz_distribution_documents"
+    id: Mapped[int]=mapped_column(primary_key=True)
+    tenant_id: Mapped[int]=mapped_column(index=True)
+    company_id: Mapped[int]=mapped_column(index=True)
+    nsu: Mapped[str]=mapped_column(String(15),default="",index=True)
+    schema_name: Mapped[str]=mapped_column(String(100),default="")
+    access_key: Mapped[str]=mapped_column(String(44),default="",index=True)
+    document_type: Mapped[str]=mapped_column(String(40),default="")
+    issuer_name: Mapped[str]=mapped_column(String(220),default="")
+    issuer_document: Mapped[str]=mapped_column(String(20),default="")
+    issue_date: Mapped[datetime|None]=mapped_column(DateTime,nullable=True)
+    total_value: Mapped[Decimal]=mapped_column(Numeric(14,2),default=0)
+    xml_path: Mapped[str]=mapped_column(String(500),default="")
+    status: Mapped[str]=mapped_column(String(30),default="RECEBIDO")
+    created_at: Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
