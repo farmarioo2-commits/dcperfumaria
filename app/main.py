@@ -2160,7 +2160,7 @@ def sefaz_import_all(
 @app.get("/api/ai/status")
 def ai_status(user: User = Depends(current_user)):
     import os
-    return {"configured": bool(os.getenv("OPENAI_API_KEY", "").strip()), "read_only": True}
+    return {"configured": True, "read_only": True, "mode": "LOCAL_SEM_CUSTO", "provider": "Gestao Facil"}
 
 @app.post("/api/ai/ask")
 def ai_ask(data: AiQuestionIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
