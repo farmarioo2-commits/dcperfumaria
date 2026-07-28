@@ -222,84 +222,78 @@ def _contains_any(text: str, terms: list[str]) -> bool:
 def _numbered(items: list[str]) -> str:
     return "\n".join(f"{i + 1}. {item}" for i, item in enumerate(items))
 
+def _normalize_question(text: str) -> str:
+    import unicodedata
+    normalized = unicodedata.normalize("NFD", text.lower())
+    return "".join(char for char in normalized if unicodedata.category(char) != "Mn")
 
-def answer_question(context: dict[str, Any], question: str, history=None) -> str:
-    q = _normalize(question).strip()
-    sales_today = context["vendas_hoje"]
-    sales_month = context["vendas_mes"]
-    finance = context["financeiro"]
-    stock = context["estoque"]
-    products = context["produtos_encontrados"]
-    top = context["mais_vendidos_mes"]
+
+def _contains_any(text: str, terms: list[str]) -> bool:
+    return any(term in text for term in terms)
+
+
+def _numbered(items: list[str]) -> str:
+    return "\n".join(f"{index + 1}. {item}" for index, item in enumerate(items))
+
+
+def answer_question(context: dict[str, Any], question: str, history: list[dict[str, str]] | None = None) -> str:
+    q = _normalize_question(question).strip()
+    sales_today = context.get("vendas_hoje", {})
+    sales_month = context.get("vendas_mes", {})
+    finance = context.get("financeiro", {})
+    stock = context.get("estoque", {})
+    products = context.get("produtos_encontrados", [])
+    top = context.get("mais_vendidos_mes", [])
 
     if _contains_any(q, ["oi", "ola", "bom dia", "boa tarde", "boa noite", "ajuda"]):
-        return (
-            "Olá! Sou o Gestão IA Local. Posso consultar vendas, estoque, produtos "
-            "e financeiro sem usar API paga."
-        )
+        return ("Olá! Sou o Gestão IA Local. Posso consultar vendas, estoque, "
+                "produtos e financeiro sem usar API paga.")
 
     if _contains_any(q, ["vendas de hoje", "vendi hoje", "faturei hoje", "faturamento hoje"]):
-        return f"Hoje foram {sales_today['quantidade']} venda(s), totalizando {sales_today['valor']}."
+        return f"Hoje foram {sales_today.get('quantidade', 0)} venda(s), totalizando {sales_today.get('valor', 'R$ 0,00')}."
 
     if _contains_any(q, ["vendas do mes", "vendi no mes", "faturei no mes", "faturamento do mes"]):
-        return f"Neste mês foram {sales_month['quantidade']} venda(s), totalizando {sales_month['valor']}."
+        return f"Neste mês foram {sales_month.get('quantidade', 0)} venda(s), totalizando {sales_month.get('valor', 'R$ 0,00')}."
 
     if _contains_any(q, ["contas vencidas", "pagar vencido", "atrasadas", "vencidas"]):
-        return (
-            f"Existem {finance['contas_vencidas']} conta(s) vencida(s), "
-            f"somando {finance['valor_vencido']}."
-        )
+        return f"Existem {finance.get('contas_vencidas', 0)} conta(s) vencida(s), somando {finance.get('valor_vencido', 'R$ 0,00')}."
 
     if _contains_any(q, ["quanto tenho para receber", "a receber", "receber aberto"]):
-        return f"O total em contas a receber em aberto é {finance['a_receber_aberto']}."
+        return f"O total em contas a receber em aberto é {finance.get('a_receber_aberto', 'R$ 0,00')}."
 
     if _contains_any(q, ["quanto tenho para pagar", "a pagar", "pagar aberto"]):
-        return f"O total em contas a pagar em aberto é {finance['a_pagar_aberto']}."
+        return f"O total em contas a pagar em aberto é {finance.get('a_pagar_aberto', 'R$ 0,00')}."
 
     if _contains_any(q, ["estoque baixo", "produtos acabando", "repor", "reposicao"]):
-        rows = stock["itens_estoque_baixo"]
+        rows = stock.get("itens_estoque_baixo", [])
         if not rows:
             return "Não há produtos com estoque igual ou abaixo do mínimo."
-        lines = [
-            f"{row['produto']} — saldo {row['saldo']} / mínimo {row['minimo']}"
-            for row in rows[:15]
-        ]
-        return f"Encontrei {stock['estoque_baixo']} produto(s) com estoque baixo:\n" + _numbered(lines)
+        lines = [f"{row.get('produto', 'Produto')} — saldo {row.get('saldo', 0)} / mínimo {row.get('minimo', 0)}" for row in rows[:15]]
+        return f"Encontrei {stock.get('estoque_baixo', len(rows))} produto(s) com estoque baixo:\n" + _numbered(lines)
 
     if _contains_any(q, ["valor do estoque", "estoque total", "quantos itens", "quantos produtos"]):
-        return (
-            f"O estoque possui {stock['produtos']} produto(s), {stock['itens']} item(ns) "
-            f"e valor de custo estimado em {stock['valor_total']}."
-        )
+        return f"O estoque possui {stock.get('produtos', 0)} produto(s) e valor de custo estimado em {stock.get('valor_total', 'R$ 0,00')}."
 
     if _contains_any(q, ["mais vendidos", "produto mais vendido", "top produtos"]):
         if not top:
             return "Ainda não há vendas registradas neste mês para calcular os mais vendidos."
-        lines = [
-            f"{row['produto']} — {row['quantidade']} un. — {row['valor']}"
-            for row in top[:10]
-        ]
+        lines = [f"{row.get('produto', 'Produto')} — {row.get('quantidade', 0)} un. — {row.get('valor', 'R$ 0,00')}" for row in top[:10]]
         return "Produtos mais vendidos neste mês:\n" + _numbered(lines)
 
     if products:
-        lines = [
-            f"{row['produto']} — saldo {row['saldo']} — preço {row['preco']}"
-            for row in products[:15]
-        ]
+        lines = [f"{row.get('produto', 'Produto')} — saldo {row.get('saldo', 0)} — preço {row.get('preco', 'R$ 0,00')}" for row in products[:15]]
         return f"Encontrei {len(products)} produto(s):\n" + _numbered(lines)
 
     if _contains_any(q, ["resumo", "situacao", "painel", "como esta"]):
         return (
             "Resumo da empresa:\n"
-            f"• Vendas hoje: {sales_today['valor']} ({sales_today['quantidade']} venda(s))\n"
-            f"• Vendas no mês: {sales_month['valor']} ({sales_month['quantidade']} venda(s))\n"
-            f"• A receber: {finance['a_receber_aberto']}\n"
-            f"• A pagar: {finance['a_pagar_aberto']}\n"
-            f"• Estoque: {stock['itens']} item(ns), valor {stock['valor_total']}\n"
-            f"• Estoque baixo: {stock['estoque_baixo']} produto(s)"
+            f"• Vendas hoje: {sales_today.get('valor', 'R$ 0,00')} ({sales_today.get('quantidade', 0)} venda(s))\n"
+            f"• Vendas no mês: {sales_month.get('valor', 'R$ 0,00')} ({sales_month.get('quantidade', 0)} venda(s))\n"
+            f"• A receber: {finance.get('a_receber_aberto', 'R$ 0,00')}\n"
+            f"• A pagar: {finance.get('a_pagar_aberto', 'R$ 0,00')}\n"
+            f"• Valor do estoque: {stock.get('valor_total', 'R$ 0,00')}\n"
+            f"• Estoque baixo: {stock.get('estoque_baixo', 0)} produto(s)"
         )
 
-    return (
-        "Ainda não entendi. Posso responder sobre vendas, contas, estoque baixo, "
-        "valor do estoque, produtos mais vendidos e pesquisa de produtos."
-    )
+    return ("Ainda não entendi essa pergunta. Posso responder sobre vendas, contas, "
+            "estoque baixo, valor do estoque, produtos mais vendidos e pesquisa de produtos.")
