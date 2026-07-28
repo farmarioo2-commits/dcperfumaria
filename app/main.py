@@ -20,6 +20,7 @@ from app.core.security import create_token, decode_token, hash_password, verify_
 from app.db.session import Base, engine, get_db
 from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, User
 from app.services.gmail_nfe_import import gmail_is_configured, sync_once
+from app.services.ai_assistant import answer_question, build_company_context
 
 Base.metadata.create_all(bind=engine)
 
@@ -65,6 +66,13 @@ class RegisterIn(BaseModel):
     owner_name: str
     email: EmailStr
     password: str
+
+
+
+class AiQuestionIn(BaseModel):
+    company_id: int
+    question: str
+    history: list[dict[str, str]] = []
 
 class LoginIn(BaseModel):
     email: EmailStr
@@ -2148,4 +2156,26 @@ def sefaz_import_all(
         "duplicates": duplicates,
         "errors": errors,
     }
+
+@app.get("/api/ai/status")
+def ai_status(user: User = Depends(current_user)):
+    import os
+    return {"configured": bool(os.getenv("OPENAI_API_KEY", "").strip()), "read_only": True}
+
+@app.post("/api/ai/ask")
+def ai_ask(data: AiQuestionIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    company = db.query(Company).filter(Company.id == data.company_id, Company.tenant_id == user.tenant_id).first()
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+    question = data.question.strip()
+    if not question:
+        raise HTTPException(400, "Digite uma pergunta")
+    try:
+        context = build_company_context(db, user.tenant_id, data.company_id, question)
+        answer = answer_question(context, question, data.history)
+        return {"answer": answer, "read_only": True}
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
+    except Exception as exc:
+        raise HTTPException(502, f"Falha ao consultar a IA: {exc}")
 
