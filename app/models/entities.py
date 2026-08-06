@@ -409,3 +409,57 @@ class DdaSyncLog(Base):
     duplicated: Mapped[int] = mapped_column(Integer, default=0)
     message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class BankStatementImport(Base):
+    __tablename__ = "bank_statement_imports"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    bank_name: Mapped[str] = mapped_column(String(120), default="")
+    account_name: Mapped[str] = mapped_column(String(160), default="")
+    file_name: Mapped[str] = mapped_column(String(240), default="")
+    file_hash: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    format: Mapped[str] = mapped_column(String(20), default="")
+    imported_count: Mapped[int] = mapped_column(Integer, default=0)
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class BankTransaction(Base):
+    __tablename__ = "bank_transactions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    statement_import_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bank_statement_imports.id"), nullable=True, index=True
+    )
+    external_id: Mapped[str] = mapped_column(String(180), default="", index=True)
+    transaction_date: Mapped[date] = mapped_column(Date, index=True)
+    description: Mapped[str] = mapped_column(String(500), default="")
+    document_number: Mapped[str] = mapped_column(String(120), default="")
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    transaction_type: Mapped[str] = mapped_column(String(20), default="DEBITO")
+    category: Mapped[str] = mapped_column(String(100), default="")
+    counterparty_name: Mapped[str] = mapped_column(String(220), default="")
+    counterparty_document: Mapped[str] = mapped_column(String(20), default="", index=True)
+    payable_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    receivable_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    dda_boleto_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    reconciliation_status: Mapped[str] = mapped_column(
+        String(30), default="PENDENTE", index=True
+    )
+    match_score: Mapped[int] = mapped_column(Integer, default=0)
+    recommendation: Mapped[str] = mapped_column(Text, default="")
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class BankReconciliationLog(Base):
+    __tablename__ = "bank_reconciliation_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    action: Mapped[str] = mapped_column(String(80), default="")
+    status: Mapped[str] = mapped_column(String(30), default="OK")
+    message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

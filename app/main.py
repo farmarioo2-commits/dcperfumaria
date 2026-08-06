@@ -20,11 +20,12 @@ import json
 
 from app.core.security import create_token, decode_token, hash_password, verify_password
 from app.db.session import Base, engine, get_db
-from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, ShopeeShop, ShopeeOrder, ShopeeSyncLog, DdaConnector, DdaBoleto, DdaSyncLog, User
+from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, ShopeeShop, ShopeeOrder, ShopeeSyncLog, DdaConnector, DdaBoleto, DdaSyncLog, BankStatementImport, BankTransaction, BankReconciliationLog, User
 from app.services.gmail_nfe_import import gmail_is_configured, sync_once
 from app.services.ai_assistant import answer_question, build_company_context
 from app.services.shopee_api import authorization_url as shopee_authorization_url, configured as shopee_configured, exchange_code as shopee_exchange_code, refresh_token as shopee_refresh_token, shop_get as shopee_shop_get
 from app.services.dda_connectors import SUPPORTED_PROVIDERS as DDA_SUPPORTED_PROVIDERS, analyze_boleto as dda_analyze_boleto, fetch_boletos as dda_fetch_boletos, provider_catalog as dda_provider_catalog
+from app.services.bank_reconciliation import analyze_match as bank_analyze_match, file_hash as bank_file_hash, parse_statement as bank_parse_statement
 from app.services.company_registry import extract_certificate_company, fetch_company_registry
 
 Base.metadata.create_all(bind=engine)
@@ -2715,6 +2716,283 @@ def dda_analysis(
             f"{sum(1 for r in rows if r.invoice_id is None)} sem NF-e vinculada."
         ),
         "alerts": alerts[:100],
+    }
+
+@app.post("/api/banking/import")
+async def banking_import_statement(
+    company_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    content = await file.read()
+    digest = bank_file_hash(content)
+    existing_import = db.query(BankStatementImport).filter(
+        BankStatementImport.file_hash == digest,
+        BankStatementImport.tenant_id == user.tenant_id,
+        BankStatementImport.company_id == company_id,
+    ).first()
+    if existing_import:
+        raise HTTPException(409, "Este extrato já foi importado")
+
+    try:
+        format_name, rows = bank_parse_statement(file.filename or "", content)
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+
+    statement = BankStatementImport(
+        tenant_id=user.tenant_id,
+        company_id=company_id,
+        file_name=file.filename or "extrato",
+        file_hash=digest,
+        format=format_name,
+    )
+    db.add(statement)
+    db.flush()
+
+    imported = 0
+    duplicated = 0
+    reconciled = 0
+
+    for item in rows:
+        duplicate = db.query(BankTransaction).filter(
+            BankTransaction.tenant_id == user.tenant_id,
+            BankTransaction.company_id == company_id,
+            BankTransaction.external_id == item["external_id"],
+        ).first()
+        if duplicate:
+            duplicated += 1
+            continue
+
+        amount = Decimal(str(item["amount"]))
+        payable = None
+        receivable = None
+        dda = None
+
+        if item["transaction_type"] == "DEBITO":
+            payable = db.query(Payable).filter(
+                Payable.tenant_id == user.tenant_id,
+                Payable.company_id == company_id,
+                Payable.value == amount,
+                Payable.status != "PAGO",
+            ).order_by(Payable.due_date.asc()).first()
+            try:
+                dda = db.query(DdaBoleto).filter(
+                    DdaBoleto.tenant_id == user.tenant_id,
+                    DdaBoleto.company_id == company_id,
+                    DdaBoleto.amount == amount,
+                    DdaBoleto.status.notin_(["PAGO", "IGNORADO"]),
+                ).order_by(DdaBoleto.due_date.asc()).first()
+            except Exception:
+                db.rollback()
+        else:
+            receivable = db.query(Receivable).filter(
+                Receivable.tenant_id == user.tenant_id,
+                Receivable.company_id == company_id,
+                Receivable.value == amount,
+                Receivable.status == "EM ABERTO",
+            ).order_by(Receivable.due_date.asc()).first()
+
+        analysis = bank_analyze_match(
+            transaction_type=item["transaction_type"],
+            amount=amount,
+            description=item["description"],
+            payable_found=bool(payable),
+            receivable_found=bool(receivable),
+            dda_found=bool(dda),
+        )
+
+        row = BankTransaction(
+            tenant_id=user.tenant_id,
+            company_id=company_id,
+            statement_import_id=statement.id,
+            external_id=item["external_id"],
+            transaction_date=item["transaction_date"],
+            description=item["description"],
+            document_number=item["document_number"],
+            amount=amount,
+            transaction_type=item["transaction_type"],
+            category=item["category"],
+            counterparty_name=item.get("counterparty_name", ""),
+            counterparty_document=item.get("counterparty_document", ""),
+            payable_id=payable.id if payable else None,
+            receivable_id=receivable.id if receivable else None,
+            dda_boleto_id=dda.id if dda else None,
+            reconciliation_status=(
+                "SUGERIDO" if analysis["score"] >= 50 else "PENDENTE"
+            ),
+            match_score=analysis["score"],
+            recommendation=analysis["recommendation"],
+            raw_json=json.dumps(item.get("raw", item), ensure_ascii=False, default=str),
+        )
+        db.add(row)
+        imported += 1
+
+        if analysis["score"] >= 80:
+            if payable:
+                payable.status = "PAGO"
+            if receivable:
+                receivable.status = "RECEBIDO"
+            if dda:
+                dda.status = "PAGO"
+            row.reconciliation_status = "CONCILIADO"
+            reconciled += 1
+
+    statement.imported_count = imported
+    statement.duplicate_count = duplicated
+    db.add(BankReconciliationLog(
+        tenant_id=user.tenant_id,
+        company_id=company_id,
+        action="IMPORT_STATEMENT",
+        status="OK",
+        message=(
+            f"{imported} transação(ões), {duplicated} duplicada(s), "
+            f"{reconciled} conciliada(s)."
+        ),
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "format": format_name,
+        "imported": imported,
+        "duplicated": duplicated,
+        "reconciled": reconciled,
+    }
+
+
+@app.get("/api/banking/transactions")
+def banking_transactions(
+    company_id: int,
+    status: str = "",
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    query = db.query(BankTransaction).filter(
+        BankTransaction.tenant_id == user.tenant_id,
+        BankTransaction.company_id == company_id,
+    )
+    if status:
+        query = query.filter(
+            BankTransaction.reconciliation_status == status.upper()
+        )
+    rows = query.order_by(
+        BankTransaction.transaction_date.desc(),
+        BankTransaction.id.desc(),
+    ).limit(1000).all()
+    return [
+        {
+            "id": row.id,
+            "date": row.transaction_date,
+            "description": row.description,
+            "amount": float(row.amount or 0),
+            "transaction_type": row.transaction_type,
+            "category": row.category,
+            "payable_id": row.payable_id,
+            "receivable_id": row.receivable_id,
+            "dda_boleto_id": row.dda_boleto_id,
+            "status": row.reconciliation_status,
+            "match_score": row.match_score,
+            "recommendation": row.recommendation,
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/banking/summary")
+def banking_summary(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(BankTransaction).filter(
+        BankTransaction.tenant_id == user.tenant_id,
+        BankTransaction.company_id == company_id,
+    ).all()
+    credits = sum(
+        (row.amount for row in rows if row.transaction_type == "CREDITO"),
+        Decimal("0"),
+    )
+    debits = sum(
+        (row.amount for row in rows if row.transaction_type == "DEBITO"),
+        Decimal("0"),
+    )
+    return {
+        "credits": float(credits),
+        "debits": float(debits),
+        "balance": float(credits - debits),
+        "pending": sum(
+            1 for row in rows if row.reconciliation_status == "PENDENTE"
+        ),
+        "suggested": sum(
+            1 for row in rows if row.reconciliation_status == "SUGERIDO"
+        ),
+        "reconciled": sum(
+            1 for row in rows if row.reconciliation_status == "CONCILIADO"
+        ),
+    }
+
+
+@app.post("/api/banking/transactions/{transaction_id}/reconcile")
+def banking_reconcile(
+    transaction_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    row = db.query(BankTransaction).filter(
+        BankTransaction.id == transaction_id,
+        BankTransaction.tenant_id == user.tenant_id,
+    ).first()
+    if not row:
+        raise HTTPException(404, "Transação não encontrada")
+
+    if row.payable_id:
+        payable = db.get(Payable, row.payable_id)
+        if payable:
+            payable.status = "PAGO"
+    if row.receivable_id:
+        receivable = db.get(Receivable, row.receivable_id)
+        if receivable:
+            receivable.status = "RECEBIDO"
+    if row.dda_boleto_id:
+        try:
+            dda = db.get(DdaBoleto, row.dda_boleto_id)
+            if dda:
+                dda.status = "PAGO"
+        except Exception:
+            db.rollback()
+
+    row.reconciliation_status = "CONCILIADO"
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/banking/analysis")
+def banking_analysis(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(BankTransaction).filter(
+        BankTransaction.tenant_id == user.tenant_id,
+        BankTransaction.company_id == company_id,
+        BankTransaction.reconciliation_status != "CONCILIADO",
+    ).order_by(BankTransaction.transaction_date.desc()).all()
+    alerts = [
+        {
+            "transaction_id": row.id,
+            "severity": "ALTO" if row.match_score < 50 else "MEDIO",
+            "title": row.description or "Transação sem descrição",
+            "detail": row.recommendation,
+            "amount": float(row.amount or 0),
+        }
+        for row in rows[:100]
+    ]
+    return {
+        "summary": (
+            f"{len(rows)} transação(ões) aguardando conferência; "
+            f"{sum(1 for row in rows if row.match_score < 50)} sem correspondência."
+        ),
+        "alerts": alerts,
     }
 
 @app.get("/health")
