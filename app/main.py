@@ -20,10 +20,11 @@ import json
 
 from app.core.security import create_token, decode_token, hash_password, verify_password
 from app.db.session import Base, engine, get_db
-from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, ShopeeShop, ShopeeOrder, ShopeeSyncLog, User
+from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, ShopeeShop, ShopeeOrder, ShopeeSyncLog, DdaConnector, DdaBoleto, DdaSyncLog, User
 from app.services.gmail_nfe_import import gmail_is_configured, sync_once
 from app.services.ai_assistant import answer_question, build_company_context
 from app.services.shopee_api import authorization_url as shopee_authorization_url, configured as shopee_configured, exchange_code as shopee_exchange_code, refresh_token as shopee_refresh_token, shop_get as shopee_shop_get
+from app.services.dda_connectors import SUPPORTED_PROVIDERS as DDA_SUPPORTED_PROVIDERS, analyze_boleto as dda_analyze_boleto, fetch_boletos as dda_fetch_boletos, provider_catalog as dda_provider_catalog
 from app.services.company_registry import extract_certificate_company, fetch_company_registry
 
 Base.metadata.create_all(bind=engine)
@@ -2208,6 +2209,513 @@ def shopee_orders(
         }
         for row in rows
     ]
+
+class DdaConnectorIn(BaseModel):
+    provider: str
+    name: str = ""
+    environment: str = "PRODUCAO"
+    credentials: dict = {}
+    active: bool = False
+    auto_create_payable: bool = True
+    require_invoice_match: bool = False
+
+
+class DdaManualBoletoIn(BaseModel):
+    external_id: str = ""
+    digitable_line: str = ""
+    beneficiary_name: str
+    beneficiary_document: str = ""
+    payer_document: str = ""
+    issue_date: date | None = None
+    due_date: date
+    amount: Decimal
+    bank_status: str = "EM_ABERTO"
+
+
+def _dda_connector_payload(row: DdaConnector) -> dict:
+    provider = DDA_SUPPORTED_PROVIDERS.get(row.provider, {})
+    return {
+        "id": row.id,
+        "provider": row.provider,
+        "provider_label": provider.get("label", row.provider),
+        "name": row.name,
+        "environment": row.environment,
+        "active": row.active,
+        "auto_create_payable": row.auto_create_payable,
+        "require_invoice_match": row.require_invoice_match,
+        "last_sync_at": row.last_sync_at,
+        "last_status": row.last_status,
+        "last_message": row.last_message,
+        "has_credentials": bool(row.credentials_encrypted),
+    }
+
+
+def _dda_boleto_payload(row: DdaBoleto) -> dict:
+    return {
+        "id": row.id,
+        "external_id": row.external_id,
+        "digitable_line": row.digitable_line,
+        "beneficiary_name": row.beneficiary_name,
+        "beneficiary_document": row.beneficiary_document,
+        "payer_document": row.payer_document,
+        "issue_date": row.issue_date,
+        "due_date": row.due_date,
+        "amount": float(row.amount or 0),
+        "status": row.status,
+        "bank_status": row.bank_status,
+        "invoice_id": row.invoice_id,
+        "payable_id": row.payable_id,
+        "match_score": row.match_score,
+        "risk_level": row.risk_level,
+        "recommendation": row.recommendation,
+        "detected_at": row.detected_at,
+    }
+
+
+def _dda_find_matches(
+    db: Session,
+    *,
+    tenant_id: int,
+    company_id: int,
+    beneficiary_document: str,
+    beneficiary_name: str,
+    amount: Decimal,
+):
+    supplier = None
+    if beneficiary_document:
+        supplier = db.query(Supplier).filter(
+            Supplier.tenant_id == tenant_id,
+            Supplier.company_id == company_id,
+            Supplier.cnpj == beneficiary_document,
+        ).first()
+
+    nfe_query = db.query(ImportedNfe).filter(
+        ImportedNfe.tenant_id == tenant_id,
+        ImportedNfe.company_id == company_id,
+        ImportedNfe.total_value == amount,
+    )
+    if beneficiary_document:
+        nfe_query = nfe_query.filter(
+            ImportedNfe.supplier_cnpj == beneficiary_document
+        )
+    invoice = nfe_query.order_by(ImportedNfe.id.desc()).first()
+    return supplier, invoice
+
+
+def _dda_upsert(
+    db: Session,
+    *,
+    user: User,
+    company_id: int,
+    connector: DdaConnector | None,
+    normalized: dict,
+) -> tuple[DdaBoleto, bool]:
+    external_id = str(normalized.get("external_id") or "")
+    line = re.sub(r"\D", "", normalized.get("digitable_line") or "")
+    query = db.query(DdaBoleto).filter(
+        DdaBoleto.tenant_id == user.tenant_id,
+        DdaBoleto.company_id == company_id,
+    )
+    existing = None
+    if line:
+        existing = query.filter(DdaBoleto.digitable_line == line).first()
+    if not existing and external_id:
+        existing = query.filter(DdaBoleto.external_id == external_id).first()
+    if existing:
+        return existing, False
+
+    beneficiary_document = re.sub(
+        r"\D", "", normalized.get("beneficiary_document") or ""
+    )
+    amount = Decimal(str(normalized.get("amount") or 0))
+    due_date = normalized["due_date"]
+    supplier, invoice = _dda_find_matches(
+        db,
+        tenant_id=user.tenant_id,
+        company_id=company_id,
+        beneficiary_document=beneficiary_document,
+        beneficiary_name=str(normalized.get("beneficiary_name") or ""),
+        amount=amount,
+    )
+    analysis = dda_analyze_boleto(
+        beneficiary_document=beneficiary_document,
+        beneficiary_name=str(normalized.get("beneficiary_name") or ""),
+        amount=amount,
+        due_date=due_date,
+        supplier_found=bool(supplier),
+        invoice_found=bool(invoice),
+        duplicated=False,
+        overdue=due_date < date.today(),
+    )
+
+    row = DdaBoleto(
+        tenant_id=user.tenant_id,
+        company_id=company_id,
+        connector_id=connector.id if connector else None,
+        external_id=external_id,
+        digitable_line=line,
+        beneficiary_name=str(normalized.get("beneficiary_name") or ""),
+        beneficiary_document=beneficiary_document,
+        payer_document=re.sub(
+            r"\D", "", normalized.get("payer_document") or ""
+        ),
+        issue_date=normalized.get("issue_date"),
+        due_date=due_date,
+        amount=amount,
+        status="NOVO",
+        bank_status=str(normalized.get("bank_status") or "EM_ABERTO"),
+        invoice_id=invoice.id if invoice else None,
+        match_score=analysis["score"],
+        risk_level=analysis["risk_level"],
+        recommendation=analysis["recommendation"],
+        raw_json=json.dumps(
+            normalized.get("raw") or normalized,
+            ensure_ascii=False,
+            default=str,
+        ),
+    )
+    db.add(row)
+    db.flush()
+
+    can_auto_create = bool(
+        connector
+        and connector.auto_create_payable
+        and (
+            not connector.require_invoice_match
+            or row.invoice_id is not None
+        )
+        and row.risk_level != "ALTO"
+    )
+    if can_auto_create:
+        payable = Payable(
+            tenant_id=user.tenant_id,
+            company_id=company_id,
+            supplier=row.beneficiary_name or "Beneficiário DDA",
+            due_date=row.due_date,
+            value=row.amount,
+            status="EM ABERTO",
+        )
+        db.add(payable)
+        db.flush()
+        row.payable_id = payable.id
+        row.status = "CONTA_CRIADA"
+
+    return row, True
+
+
+@app.get("/api/dda/providers")
+def dda_providers(user: User = Depends(current_user)):
+    return dda_provider_catalog()
+
+
+@app.get("/api/dda/connectors")
+def dda_connectors(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(DdaConnector).filter(
+        DdaConnector.tenant_id == user.tenant_id,
+        DdaConnector.company_id == company_id,
+    ).order_by(DdaConnector.id.desc()).all()
+    return [_dda_connector_payload(row) for row in rows]
+
+
+@app.post("/api/dda/connectors")
+def dda_save_connector(
+    company_id: int,
+    data: DdaConnectorIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    provider = data.provider.upper().strip()
+    if provider not in DDA_SUPPORTED_PROVIDERS:
+        raise HTTPException(400, "Banco ou provedor DDA não suportado")
+
+    row = DdaConnector(
+        tenant_id=user.tenant_id,
+        company_id=company_id,
+        provider=provider,
+        name=data.name or DDA_SUPPORTED_PROVIDERS[provider]["label"],
+        environment=data.environment.upper(),
+        credentials_encrypted=_encrypt_secret(
+            json.dumps(data.credentials, ensure_ascii=False)
+        ) if data.credentials else "",
+        active=data.active,
+        auto_create_payable=data.auto_create_payable,
+        require_invoice_match=data.require_invoice_match,
+        last_status=(
+            "PRONTO"
+            if data.credentials
+            else "AGUARDANDO_CREDENCIAIS"
+        ),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _dda_connector_payload(row)
+
+
+@app.post("/api/dda/connectors/{connector_id}/sync")
+def dda_sync_connector(
+    connector_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    connector = db.query(DdaConnector).filter(
+        DdaConnector.id == connector_id,
+        DdaConnector.tenant_id == user.tenant_id,
+    ).first()
+    if not connector:
+        raise HTTPException(404, "Conector DDA não encontrado")
+    if not connector.active:
+        raise HTTPException(400, "Ative o conector antes de sincronizar")
+    if not connector.credentials_encrypted:
+        raise HTTPException(400, "Cadastre as credenciais do banco")
+
+    credentials = json.loads(
+        _decrypt_secret(connector.credentials_encrypted)
+    )
+    try:
+        items = dda_fetch_boletos(connector.provider, credentials)
+        imported = 0
+        duplicated = 0
+        for item in items:
+            _, created = _dda_upsert(
+                db,
+                user=user,
+                company_id=connector.company_id,
+                connector=connector,
+                normalized=item,
+            )
+            if created:
+                imported += 1
+            else:
+                duplicated += 1
+        connector.last_sync_at = datetime.utcnow()
+        connector.last_status = "OK"
+        connector.last_message = (
+            f"{imported} importado(s), {duplicated} duplicado(s)."
+        )
+        db.add(DdaSyncLog(
+            tenant_id=user.tenant_id,
+            company_id=connector.company_id,
+            connector_id=connector.id,
+            provider=connector.provider,
+            status="OK",
+            imported=imported,
+            duplicated=duplicated,
+            message=connector.last_message,
+        ))
+        db.commit()
+        return {
+            "ok": True,
+            "imported": imported,
+            "duplicated": duplicated,
+        }
+    except Exception as exc:
+        db.rollback()
+        connector = db.get(DdaConnector, connector_id)
+        if connector:
+            connector.last_sync_at = datetime.utcnow()
+            connector.last_status = "ERRO"
+            connector.last_message = str(exc)[:500]
+            db.add(DdaSyncLog(
+                tenant_id=user.tenant_id,
+                company_id=connector.company_id,
+                connector_id=connector.id,
+                provider=connector.provider,
+                status="ERRO",
+                message=str(exc)[:500],
+            ))
+            db.commit()
+        raise HTTPException(502, str(exc))
+
+
+@app.post("/api/dda/boletos/manual")
+def dda_manual_boleto(
+    company_id: int,
+    data: DdaManualBoletoIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    normalized = data.model_dump()
+    normalized["beneficiary_document"] = re.sub(
+        r"\D", "", data.beneficiary_document
+    )
+    normalized["payer_document"] = re.sub(
+        r"\D", "", data.payer_document
+    )
+    row, created = _dda_upsert(
+        db,
+        user=user,
+        company_id=company_id,
+        connector=None,
+        normalized=normalized,
+    )
+    if not created:
+        raise HTTPException(409, "Este boleto já está cadastrado")
+    db.commit()
+    return _dda_boleto_payload(row)
+
+
+@app.get("/api/dda/boletos")
+def dda_list_boletos(
+    company_id: int,
+    status: str = "",
+    search: str = "",
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    query = db.query(DdaBoleto).filter(
+        DdaBoleto.tenant_id == user.tenant_id,
+        DdaBoleto.company_id == company_id,
+    )
+    if status:
+        query = query.filter(DdaBoleto.status == status.upper())
+    if search:
+        term = f"%{search}%"
+        query = query.filter(
+            DdaBoleto.beneficiary_name.ilike(term)
+            | DdaBoleto.beneficiary_document.ilike(term)
+            | DdaBoleto.digitable_line.ilike(term)
+        )
+    rows = query.order_by(
+        DdaBoleto.due_date.asc(),
+        DdaBoleto.id.desc(),
+    ).limit(1000).all()
+    return [_dda_boleto_payload(row) for row in rows]
+
+
+@app.get("/api/dda/summary")
+def dda_summary(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(DdaBoleto).filter(
+        DdaBoleto.tenant_id == user.tenant_id,
+        DdaBoleto.company_id == company_id,
+    ).all()
+    today = date.today()
+    open_rows = [
+        row for row in rows
+        if row.status not in {"PAGO", "IGNORADO"}
+    ]
+    return {
+        "total_open": float(sum((row.amount for row in open_rows), Decimal("0"))),
+        "count_open": len(open_rows),
+        "overdue_value": float(sum(
+            (row.amount for row in open_rows if row.due_date < today),
+            Decimal("0"),
+        )),
+        "overdue_count": sum(1 for row in open_rows if row.due_date < today),
+        "next_7_days_value": float(sum(
+            (
+                row.amount for row in open_rows
+                if 0 <= (row.due_date - today).days <= 7
+            ),
+            Decimal("0"),
+        )),
+        "unmatched_count": sum(1 for row in open_rows if row.invoice_id is None),
+        "high_risk_count": sum(1 for row in open_rows if row.risk_level == "ALTO"),
+        "connectors": db.query(DdaConnector).filter(
+            DdaConnector.tenant_id == user.tenant_id,
+            DdaConnector.company_id == company_id,
+        ).count(),
+    }
+
+
+@app.post("/api/dda/boletos/{boleto_id}/approve")
+def dda_approve_boleto(
+    boleto_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    row = db.query(DdaBoleto).filter(
+        DdaBoleto.id == boleto_id,
+        DdaBoleto.tenant_id == user.tenant_id,
+    ).first()
+    if not row:
+        raise HTTPException(404, "Boleto não encontrado")
+    if not row.payable_id:
+        payable = Payable(
+            tenant_id=user.tenant_id,
+            company_id=row.company_id,
+            supplier=row.beneficiary_name or "Beneficiário DDA",
+            due_date=row.due_date,
+            value=row.amount,
+            status="EM ABERTO",
+        )
+        db.add(payable)
+        db.flush()
+        row.payable_id = payable.id
+    row.status = "APROVADO"
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    return _dda_boleto_payload(row)
+
+
+@app.post("/api/dda/boletos/{boleto_id}/ignore")
+def dda_ignore_boleto(
+    boleto_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    row = db.query(DdaBoleto).filter(
+        DdaBoleto.id == boleto_id,
+        DdaBoleto.tenant_id == user.tenant_id,
+    ).first()
+    if not row:
+        raise HTTPException(404, "Boleto não encontrado")
+    row.status = "IGNORADO"
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/dda/analysis")
+def dda_analysis(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(DdaBoleto).filter(
+        DdaBoleto.tenant_id == user.tenant_id,
+        DdaBoleto.company_id == company_id,
+        DdaBoleto.status.notin_(["PAGO", "IGNORADO"]),
+    ).order_by(DdaBoleto.due_date.asc()).all()
+    alerts = []
+    for row in rows:
+        if row.risk_level == "ALTO":
+            alerts.append({
+                "severity": "ALTO",
+                "title": f"Revisar boleto de {row.beneficiary_name}",
+                "detail": row.recommendation,
+                "boleto_id": row.id,
+            })
+        elif row.due_date < date.today():
+            alerts.append({
+                "severity": "MEDIO",
+                "title": f"Boleto vencido: {row.beneficiary_name}",
+                "detail": f"Valor R$ {float(row.amount):.2f}",
+                "boleto_id": row.id,
+            })
+        elif row.invoice_id is None:
+            alerts.append({
+                "severity": "MEDIO",
+                "title": f"Sem NF-e vinculada: {row.beneficiary_name}",
+                "detail": row.recommendation,
+                "boleto_id": row.id,
+            })
+    return {
+        "summary": (
+            f"{len(rows)} boleto(s) em análise; "
+            f"{sum(1 for r in rows if r.risk_level == 'ALTO')} de alto risco; "
+            f"{sum(1 for r in rows if r.invoice_id is None)} sem NF-e vinculada."
+        ),
+        "alerts": alerts[:100],
+    }
 
 @app.get("/health")
 def health():

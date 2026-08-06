@@ -349,3 +349,63 @@ class ShopeeSyncLog(Base):
     status: Mapped[str] = mapped_column(String(30), default="OK")
     message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class DdaConnector(Base):
+    __tablename__ = "dda_connectors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    name: Mapped[str] = mapped_column(String(140), default="")
+    environment: Mapped[str] = mapped_column(String(20), default="PRODUCAO")
+    credentials_encrypted: Mapped[str] = mapped_column(Text, default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_create_payable: Mapped[bool] = mapped_column(Boolean, default=True)
+    require_invoice_match: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_status: Mapped[str] = mapped_column(String(30), default="AGUARDANDO_CREDENCIAIS")
+    last_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class DdaBoleto(Base):
+    __tablename__ = "dda_boletos"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    connector_id: Mapped[int | None] = mapped_column(
+        ForeignKey("dda_connectors.id"), nullable=True, index=True
+    )
+    external_id: Mapped[str] = mapped_column(String(180), default="", index=True)
+    digitable_line: Mapped[str] = mapped_column(String(100), default="", index=True)
+    beneficiary_name: Mapped[str] = mapped_column(String(220), default="")
+    beneficiary_document: Mapped[str] = mapped_column(String(20), default="", index=True)
+    payer_document: Mapped[str] = mapped_column(String(20), default="")
+    issue_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    due_date: Mapped[date] = mapped_column(Date, index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    status: Mapped[str] = mapped_column(String(30), default="NOVO", index=True)
+    bank_status: Mapped[str] = mapped_column(String(50), default="")
+    invoice_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    payable_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    match_score: Mapped[int] = mapped_column(Integer, default=0)
+    risk_level: Mapped[str] = mapped_column(String(20), default="MEDIO")
+    recommendation: Mapped[str] = mapped_column(Text, default="")
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+    detected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class DdaSyncLog(Base):
+    __tablename__ = "dda_sync_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    connector_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    status: Mapped[str] = mapped_column(String(30), default="OK")
+    imported: Mapped[int] = mapped_column(Integer, default=0)
+    duplicated: Mapped[int] = mapped_column(Integer, default=0)
+    message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
