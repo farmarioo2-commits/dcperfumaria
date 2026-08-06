@@ -1483,8 +1483,14 @@ def gmail_sync(user: User = Depends(current_user)):
         raise HTTPException(500, str(exc))
 
 @app.get("/api/dashboard")
-def dashboard(company_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def dashboard(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     today = date.today()
+    month_start = today.replace(day=1)
+
     products = db.query(Product).filter(
         Product.tenant_id == user.tenant_id,
         Product.company_id == company_id,
@@ -1492,123 +1498,186 @@ def dashboard(company_id: int, db: Session = Depends(get_db), user: User = Depen
 
     stock_units = 0
     stock_value = 0.0
-    low_stock = 0
+    low_stock_items = []
     for product in products:
-        current_stock = stock_of(db, user.tenant_id, company_id, product.id)
-        stock_units += current_stock
-        stock_value += current_stock * float(product.unit_cost)
-        if current_stock <= product.minimum_stock:
-            low_stock += 1
+        stock = stock_of(db, user.tenant_id, company_id, product.id)
+        stock_units += stock
+        stock_value += stock * float(product.unit_cost or 0)
+        if stock <= (product.minimum_stock or 0):
+            low_stock_items.append({
+                "id": product.id,
+                "name": product.name,
+                "stock": stock,
+                "minimum_stock": product.minimum_stock or 0,
+            })
 
-    sales_month = db.query(func.coalesce(func.sum(Sale.total), 0)).filter(
+    sales_month_query = db.query(
+        func.coalesce(func.sum(Sale.total), 0),
+        func.count(Sale.id),
+    ).filter(
         Sale.tenant_id == user.tenant_id,
         Sale.company_id == company_id,
-        func.extract("year", Sale.sale_date) == today.year,
-        func.extract("month", Sale.sale_date) == today.month,
-    ).scalar() or 0
+        Sale.sale_date >= month_start,
+        Sale.sale_date <= today,
+        Sale.status == "CONCLUÍDA",
+    ).one()
 
-    sales_today = db.query(func.coalesce(func.sum(Sale.total), 0)).filter(
+    sales_today_query = db.query(
+        func.coalesce(func.sum(Sale.total), 0),
+        func.count(Sale.id),
+    ).filter(
         Sale.tenant_id == user.tenant_id,
         Sale.company_id == company_id,
         Sale.sale_date == today,
-    ).scalar() or 0
+        Sale.status == "CONCLUÍDA",
+    ).one()
 
-    sales_today_count = db.query(func.count(Sale.id)).filter(
-        Sale.tenant_id == user.tenant_id,
-        Sale.company_id == company_id,
-        Sale.sale_date == today,
-    ).scalar() or 0
-
-    payables_month = db.query(func.coalesce(func.sum(Payable.value), 0)).filter(
+    payables_open = db.query(func.coalesce(func.sum(Payable.value), 0)).filter(
         Payable.tenant_id == user.tenant_id,
         Payable.company_id == company_id,
-        func.extract("year", Payable.due_date) == today.year,
-        func.extract("month", Payable.due_date) == today.month,
         Payable.status != "PAGO",
     ).scalar() or 0
 
-    overdue_query = db.query(Payable).filter(
-        Payable.tenant_id == user.tenant_id,
-        Payable.company_id == company_id,
-        Payable.due_date < today,
-        Payable.status != "PAGO",
-    )
-    overdue_payables_count = overdue_query.count()
-    overdue_payables_value = sum((row.value for row in overdue_query.all()), Decimal("0"))
-
-    due_today_query = db.query(Payable).filter(
-        Payable.tenant_id == user.tenant_id,
-        Payable.company_id == company_id,
-        Payable.due_date == today,
-        Payable.status != "PAGO",
-    )
-    due_today_count = due_today_query.count()
-    due_today_value = sum((row.value for row in due_today_query.all()), Decimal("0"))
-
-    receivables_open_query = db.query(Receivable).filter(
-        Receivable.tenant_id == user.tenant_id,
-        Receivable.company_id == company_id,
-        Receivable.status == "EM ABERTO",
-    )
     receivables_open = db.query(func.coalesce(func.sum(Receivable.value), 0)).filter(
         Receivable.tenant_id == user.tenant_id,
         Receivable.company_id == company_id,
         Receivable.status == "EM ABERTO",
     ).scalar() or 0
 
-    received_month = db.query(func.coalesce(func.sum(Receivable.value), 0)).filter(
-        Receivable.tenant_id == user.tenant_id,
-        Receivable.company_id == company_id,
-        Receivable.status == "RECEBIDO",
-        func.extract("year", Receivable.received_date) == today.year,
-        func.extract("month", Receivable.received_date) == today.month,
-    ).scalar() or 0
+    overdue_query = db.query(
+        func.coalesce(func.sum(Payable.value), 0),
+        func.count(Payable.id),
+    ).filter(
+        Payable.tenant_id == user.tenant_id,
+        Payable.company_id == company_id,
+        Payable.status != "PAGO",
+        Payable.due_date < today,
+    ).one()
+
+    # Série dos últimos seis meses, compatível com SQLite e PostgreSQL.
+    sales_chart = []
+    cursor_year = today.year
+    cursor_month = today.month
+    months = []
+    for _ in range(6):
+        months.append((cursor_year, cursor_month))
+        cursor_month -= 1
+        if cursor_month == 0:
+            cursor_month = 12
+            cursor_year -= 1
+    months.reverse()
+
+    month_labels = [
+        "Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+        "Jul", "Ago", "Set", "Out", "Nov", "Dez",
+    ]
+    for year_value, month_value in months:
+        if month_value == 12:
+            next_year, next_month = year_value + 1, 1
+        else:
+            next_year, next_month = year_value, month_value + 1
+        start = date(year_value, month_value, 1)
+        end = date(next_year, next_month, 1)
+        total = db.query(func.coalesce(func.sum(Sale.total), 0)).filter(
+            Sale.tenant_id == user.tenant_id,
+            Sale.company_id == company_id,
+            Sale.sale_date >= start,
+            Sale.sale_date < end,
+            Sale.status == "CONCLUÍDA",
+        ).scalar() or 0
+        sales_chart.append({
+            "label": month_labels[month_value - 1],
+            "value": float(total),
+        })
+
+    top_products_rows = db.query(
+        Product.name,
+        func.coalesce(func.sum(SaleItem.quantity), 0).label("quantity"),
+        func.coalesce(func.sum(SaleItem.total), 0).label("value"),
+    ).join(
+        SaleItem, SaleItem.product_id == Product.id,
+    ).join(
+        Sale, Sale.id == SaleItem.sale_id,
+    ).filter(
+        Product.tenant_id == user.tenant_id,
+        Product.company_id == company_id,
+        Sale.tenant_id == user.tenant_id,
+        Sale.company_id == company_id,
+        Sale.sale_date >= month_start,
+        Sale.sale_date <= today,
+        Sale.status == "CONCLUÍDA",
+    ).group_by(
+        Product.id,
+        Product.name,
+    ).order_by(
+        func.sum(SaleItem.quantity).desc(),
+    ).limit(5).all()
 
     recent_sales_rows = db.query(Sale).filter(
         Sale.tenant_id == user.tenant_id,
         Sale.company_id == company_id,
-    ).order_by(Sale.id.desc()).limit(6).all()
+    ).order_by(
+        Sale.sale_date.desc(),
+        Sale.id.desc(),
+    ).limit(6).all()
 
+    sefaz_pending = 0
     try:
         sefaz_pending = db.query(func.count(SefazDistributionDocument.id)).filter(
             SefazDistributionDocument.tenant_id == user.tenant_id,
             SefazDistributionDocument.company_id == company_id,
-            SefazDistributionDocument.status.in_([
-                "RECEBIDO",
-                "AGUARDANDO_MANIFESTACAO",
-            ]),
+            SefazDistributionDocument.status == "RECEBIDO",
         ).scalar() or 0
     except Exception:
-        # Mantém o dashboard disponível mesmo antes da tabela SEFAZ existir.
-        sefaz_pending = 0
+        db.rollback()
 
     return {
+        # Campos antigos preservados para compatibilidade.
         "products": len(products),
         "stock_units": stock_units,
         "stock_value": stock_value,
-        "low_stock": low_stock,
-        "sales_today": float(sales_today),
-        "sales_today_count": int(sales_today_count),
-        "sales_month": float(sales_month),
-        "payables_month": float(payables_month),
-        "overdue_payables_count": int(overdue_payables_count),
-        "overdue_payables_value": float(overdue_payables_value),
-        "due_today_count": int(due_today_count),
-        "due_today_value": float(due_today_value),
+        "low_stock": len(low_stock_items),
+        "sales_month": float(sales_month_query[0] or 0),
+        "payables_month": float(payables_open),
         "receivables_open": float(receivables_open),
-        "receivables_count": int(receivables_open_query.count()),
-        "received_month": float(received_month),
+        "received_month": float(
+            db.query(func.coalesce(func.sum(Receivable.value), 0)).filter(
+                Receivable.tenant_id == user.tenant_id,
+                Receivable.company_id == company_id,
+                Receivable.status == "RECEBIDO",
+                Receivable.received_date >= month_start,
+                Receivable.received_date <= today,
+            ).scalar() or 0
+        ),
+
+        # Dashboard inteligente.
+        "sales_today": float(sales_today_query[0] or 0),
+        "sales_today_count": int(sales_today_query[1] or 0),
+        "sales_month_count": int(sales_month_query[1] or 0),
+        "payables_open": float(payables_open),
+        "overdue_payables_count": int(overdue_query[1] or 0),
+        "overdue_payables_value": float(overdue_query[0] or 0),
         "sefaz_pending": int(sefaz_pending),
+        "sales_chart": sales_chart,
+        "low_stock_items": low_stock_items[:8],
+        "top_products": [
+            {
+                "name": row.name,
+                "quantity": int(row.quantity or 0),
+                "value": float(row.value or 0),
+            }
+            for row in top_products_rows
+        ],
         "recent_sales": [
             {
-                "id": sale.id,
-                "number": sale.number,
-                "customer_name": sale.customer_name,
-                "total": float(sale.total),
-                "sale_date": sale.sale_date,
-                "status": sale.status,
+                "id": row.id,
+                "number": row.number,
+                "customer": row.customer_name,
+                "date": row.sale_date.isoformat(),
+                "total": float(row.total or 0),
+                "status": row.status,
             }
-            for sale in recent_sales_rows
+            for row in recent_sales_rows
         ],
     }
 
