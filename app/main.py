@@ -16,12 +16,14 @@ from pypdf import PdfReader
 from cryptography.fernet import Fernet
 import base64
 import xml.etree.ElementTree as ET
+import json
 
 from app.core.security import create_token, decode_token, hash_password, verify_password
 from app.db.session import Base, engine, get_db
-from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, User
+from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, ShopeeShop, ShopeeOrder, ShopeeSyncLog, User
 from app.services.gmail_nfe_import import gmail_is_configured, sync_once
 from app.services.ai_assistant import answer_question, build_company_context
+from app.services.shopee_api import authorization_url as shopee_authorization_url, configured as shopee_configured, exchange_code as shopee_exchange_code, refresh_token as shopee_refresh_token, shop_get as shopee_shop_get
 from app.services.company_registry import extract_certificate_company, fetch_company_registry
 
 Base.metadata.create_all(bind=engine)
@@ -1973,6 +1975,239 @@ def dashboard(
             for row in recent_sales_rows
         ],
     }
+
+@app.get("/api/marketplaces/shopee/status")
+def shopee_status(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    shops = db.query(ShopeeShop).filter(
+        ShopeeShop.tenant_id == user.tenant_id,
+        ShopeeShop.company_id == company_id,
+    ).order_by(ShopeeShop.id.desc()).all()
+    return {
+        "configured": shopee_configured(),
+        "approval_pending": not shopee_configured(),
+        "shops": [
+            {
+                "id": row.id,
+                "shop_id": row.shop_id,
+                "shop_name": row.shop_name or f"Loja {row.shop_id}",
+                "region": row.region,
+                "connected": row.connected,
+                "last_sync_at": row.last_sync_at.isoformat()
+                if row.last_sync_at else None,
+            }
+            for row in shops
+        ],
+    }
+
+
+@app.get("/api/marketplaces/shopee/connect-url")
+def shopee_connect_url(
+    company_id: int,
+    user: User = Depends(current_user),
+):
+    if not shopee_configured():
+        raise HTTPException(
+            400,
+            "Aguardando aprovação do aplicativo e configuração "
+            "de SHOPEE_PARTNER_ID, SHOPEE_PARTNER_KEY e SHOPEE_REDIRECT_URL.",
+        )
+    state_payload = (
+        f"{user.tenant_id}:{company_id}:{user.id}:"
+        f"{int(datetime.utcnow().timestamp())}"
+    )
+    state = base64.urlsafe_b64encode(
+        state_payload.encode("utf-8")
+    ).decode("ascii")
+    return {"url": shopee_authorization_url(state)}
+
+
+@app.get("/api/marketplaces/shopee/callback")
+def shopee_callback(
+    code: str,
+    shop_id: int,
+    state: str,
+    db: Session = Depends(get_db),
+):
+    try:
+        decoded = base64.urlsafe_b64decode(
+            state.encode("ascii")
+        ).decode("utf-8")
+        tenant_id, company_id, user_id, _ = [
+            int(part) for part in decoded.split(":")
+        ]
+    except Exception as exc:
+        raise HTTPException(400, "Estado OAuth inválido") from exc
+
+    tokens = shopee_exchange_code(code, shop_id)
+    access_token = tokens.get("access_token", "")
+    refresh_token = tokens.get("refresh_token", "")
+    expire_in = int(tokens.get("expire_in", 0) or 0)
+
+    shop = db.query(ShopeeShop).filter(
+        ShopeeShop.tenant_id == tenant_id,
+        ShopeeShop.company_id == company_id,
+        ShopeeShop.shop_id == shop_id,
+    ).first()
+    if not shop:
+        shop = ShopeeShop(
+            tenant_id=tenant_id,
+            company_id=company_id,
+            shop_id=shop_id,
+        )
+        db.add(shop)
+
+    shop.access_token_encrypted = _encrypt_secret(access_token)
+    shop.refresh_token_encrypted = _encrypt_secret(refresh_token)
+    shop.token_expires_at = (
+        datetime.utcnow() + timedelta(seconds=expire_in)
+        if expire_in else None
+    )
+    shop.connected = True
+    shop.updated_at = datetime.utcnow()
+    db.commit()
+
+    try:
+        info = shopee_shop_get(
+            "/api/v2/shop/get_shop_info",
+            access_token,
+            shop_id,
+        )
+        response = info.get("response") or {}
+        shop.shop_name = response.get("shop_name", "") or shop.shop_name
+        shop.region = response.get("region", "BR") or "BR"
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return {
+        "ok": True,
+        "message": "Loja Shopee conectada. Pode voltar ao Gestão Fácil.",
+        "shop_id": shop_id,
+    }
+
+
+@app.post("/api/marketplaces/shopee/sync")
+def shopee_sync_orders(
+    company_id: int,
+    shop_record_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    shop = db.query(ShopeeShop).filter(
+        ShopeeShop.id == shop_record_id,
+        ShopeeShop.tenant_id == user.tenant_id,
+        ShopeeShop.company_id == company_id,
+    ).first()
+    if not shop:
+        raise HTTPException(404, "Loja Shopee não encontrada")
+
+    access_token = _decrypt_secret(shop.access_token_encrypted)
+    refresh_token_value = _decrypt_secret(shop.refresh_token_encrypted)
+
+    if (
+        shop.token_expires_at
+        and shop.token_expires_at <= datetime.utcnow() + timedelta(minutes=5)
+    ):
+        refreshed = shopee_refresh_token(
+            refresh_token_value,
+            shop.shop_id,
+        )
+        access_token = refreshed.get("access_token", access_token)
+        refresh_token_value = refreshed.get(
+            "refresh_token",
+            refresh_token_value,
+        )
+        shop.access_token_encrypted = _encrypt_secret(access_token)
+        shop.refresh_token_encrypted = _encrypt_secret(refresh_token_value)
+        expire_in = int(refreshed.get("expire_in", 0) or 0)
+        shop.token_expires_at = (
+            datetime.utcnow() + timedelta(seconds=expire_in)
+            if expire_in else None
+        )
+        db.commit()
+
+    now = int(datetime.utcnow().timestamp())
+    start = now - (15 * 24 * 60 * 60)
+    result = shopee_shop_get(
+        "/api/v2/order/get_order_list",
+        access_token,
+        shop.shop_id,
+        time_range_field="create_time",
+        time_from=start,
+        time_to=now,
+        page_size=50,
+        response_optional_fields="order_status",
+    )
+    response = result.get("response") or {}
+    order_list = response.get("order_list") or []
+
+    imported = 0
+    updated = 0
+    for item in order_list:
+        order_sn = str(item.get("order_sn") or "")
+        if not order_sn:
+            continue
+        row = db.query(ShopeeOrder).filter(
+            ShopeeOrder.order_sn == order_sn
+        ).first()
+        if not row:
+            row = ShopeeOrder(
+                tenant_id=user.tenant_id,
+                company_id=company_id,
+                shopee_shop_id=shop.id,
+                order_sn=order_sn,
+            )
+            db.add(row)
+            imported += 1
+        else:
+            updated += 1
+        row.status = str(item.get("order_status") or "")
+        row.raw_json = json.dumps(item, ensure_ascii=False)
+        row.updated_at = datetime.utcnow()
+
+    shop.last_sync_at = datetime.utcnow()
+    db.add(ShopeeSyncLog(
+        tenant_id=user.tenant_id,
+        company_id=company_id,
+        shopee_shop_id=shop.id,
+        action="SYNC_ORDERS",
+        status="OK",
+        message=f"{imported} novo(s), {updated} atualizado(s).",
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "imported": imported,
+        "updated": updated,
+        "total_found": len(order_list),
+    }
+
+
+@app.get("/api/marketplaces/shopee/orders")
+def shopee_orders(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(ShopeeOrder).filter(
+        ShopeeOrder.tenant_id == user.tenant_id,
+        ShopeeOrder.company_id == company_id,
+    ).order_by(ShopeeOrder.updated_at.desc()).limit(200).all()
+    return [
+        {
+            "order_sn": row.order_sn,
+            "status": row.status,
+            "buyer_username": row.buyer_username,
+            "total_amount": float(row.total_amount or 0),
+            "tracking_number": row.tracking_number,
+            "updated_at": row.updated_at.isoformat(),
+        }
+        for row in rows
+    ]
 
 @app.get("/health")
 def health():

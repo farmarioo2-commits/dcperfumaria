@@ -304,3 +304,48 @@ class SefazDistributionDocument(Base):
     xml_path: Mapped[str]=mapped_column(String(500),default="")
     status: Mapped[str]=mapped_column(String(30),default="RECEBIDO")
     created_at: Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+
+class ShopeeShop(Base):
+    __tablename__ = "shopee_shops"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    shop_id: Mapped[int] = mapped_column(Integer, index=True)
+    shop_name: Mapped[str] = mapped_column(String(220), default="")
+    region: Mapped[str] = mapped_column(String(10), default="BR")
+    access_token_encrypted: Mapped[str] = mapped_column(Text, default="")
+    refresh_token_encrypted: Mapped[str] = mapped_column(Text, default="")
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    connected: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ShopeeOrder(Base):
+    __tablename__ = "shopee_orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    shopee_shop_id: Mapped[int] = mapped_column(ForeignKey("shopee_shops.id"), index=True)
+    order_sn: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(60), default="")
+    buyer_username: Mapped[str] = mapped_column(String(180), default="")
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    currency: Mapped[str] = mapped_column(String(10), default="BRL")
+    tracking_number: Mapped[str] = mapped_column(String(120), default="")
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+    order_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ShopeeSyncLog(Base):
+    __tablename__ = "shopee_sync_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    shopee_shop_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(80), default="")
+    status: Mapped[str] = mapped_column(String(30), default="OK")
+    message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
