@@ -1,4 +1,5 @@
 import re
+import math
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -1481,6 +1482,176 @@ def gmail_sync(user: User = Depends(current_user)):
         return sync_once()
     except Exception as exc:
         raise HTTPException(500, str(exc))
+
+
+
+@app.get("/api/stock/intelligence")
+def stock_intelligence(
+    company_id: int,
+    period_days: int = 90,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    if period_days not in {30, 60, 90, 180}:
+        period_days = 90
+
+    today = date.today()
+    since = today - timedelta(days=period_days - 1)
+    products = db.query(Product).filter(
+        Product.tenant_id == user.tenant_id,
+        Product.company_id == company_id,
+    ).order_by(Product.name).all()
+
+    sales_rows = db.query(
+        SaleItem.product_id,
+        func.coalesce(func.sum(SaleItem.quantity), 0).label("sold_quantity"),
+        func.coalesce(func.sum(SaleItem.total), 0).label("sold_value"),
+        func.max(Sale.sale_date).label("last_sale_date"),
+    ).join(Sale, Sale.id == SaleItem.sale_id).filter(
+        Sale.tenant_id == user.tenant_id,
+        Sale.company_id == company_id,
+        Sale.sale_date >= since,
+        Sale.sale_date <= today,
+        Sale.status == "CONCLUÍDA",
+    ).group_by(SaleItem.product_id).all()
+
+    sales_by_product = {
+        int(row.product_id): {
+            "quantity": int(row.sold_quantity or 0),
+            "value": float(row.sold_value or 0),
+            "last_sale_date": row.last_sale_date,
+        }
+        for row in sales_rows
+    }
+
+    total_revenue = sum(item["value"] for item in sales_by_product.values())
+    revenue_order = sorted(
+        ((product.id, sales_by_product.get(product.id, {}).get("value", 0.0)) for product in products),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    abc_by_product = {}
+    accumulated = 0.0
+    for product_id, revenue in revenue_order:
+        accumulated += revenue
+        share = (accumulated / total_revenue) if total_revenue > 0 else 1.0
+        abc_by_product[product_id] = "A" if share <= 0.80 else ("B" if share <= 0.95 else "C")
+
+    rows = []
+    summary = {
+        "products": len(products),
+        "stock_units": 0,
+        "stock_value": 0.0,
+        "low_stock": 0,
+        "zero_stock": 0,
+        "negative_stock": 0,
+        "without_sales": 0,
+        "suggested_purchase_units": 0,
+        "suggested_purchase_value": 0.0,
+    }
+
+    for product in products:
+        current_stock = stock_of(db, user.tenant_id, company_id, product.id)
+        sales = sales_by_product.get(product.id, {})
+        sold_quantity = int(sales.get("quantity", 0))
+        sold_value = float(sales.get("value", 0))
+        last_sale_date = sales.get("last_sale_date")
+        average_daily = sold_quantity / period_days
+        coverage_days = round(current_stock / average_daily, 1) if average_daily > 0 and current_stock > 0 else None
+        demand_30_days = math.ceil(average_daily * 30)
+        target_stock = max(int(product.minimum_stock or 0), demand_30_days)
+        suggested_quantity = max(target_stock - current_stock, 0)
+        days_without_sale = (today - last_sale_date).days if last_sale_date else None
+
+        if current_stock < 0:
+            status = "NEGATIVO"
+        elif current_stock == 0:
+            status = "ZERADO"
+        elif current_stock <= int(product.minimum_stock or 0):
+            status = "BAIXO"
+        elif sold_quantity == 0:
+            status = "SEM_VENDA"
+        else:
+            status = "NORMAL"
+
+        unit_cost = float(product.unit_cost or 0)
+        inventory_value = max(current_stock, 0) * unit_cost
+        suggested_value = suggested_quantity * unit_cost
+
+        summary["stock_units"] += current_stock
+        summary["stock_value"] += inventory_value
+        summary["suggested_purchase_units"] += suggested_quantity
+        summary["suggested_purchase_value"] += suggested_value
+        if current_stock <= int(product.minimum_stock or 0):
+            summary["low_stock"] += 1
+        if current_stock == 0:
+            summary["zero_stock"] += 1
+        if current_stock < 0:
+            summary["negative_stock"] += 1
+        if sold_quantity == 0:
+            summary["without_sales"] += 1
+
+        rows.append({
+            "id": product.id,
+            "name": product.name,
+            "sku": product.sku,
+            "barcode": product.barcode,
+            "category": product.category,
+            "unit": product.unit,
+            "current_stock": current_stock,
+            "minimum_stock": int(product.minimum_stock or 0),
+            "unit_cost": unit_cost,
+            "sale_price": float(product.sale_price or 0),
+            "inventory_value": round(inventory_value, 2),
+            "sold_quantity": sold_quantity,
+            "sold_value": round(sold_value, 2),
+            "average_daily_sales": round(average_daily, 3),
+            "coverage_days": coverage_days,
+            "days_without_sale": days_without_sale,
+            "abc_class": abc_by_product.get(product.id, "C"),
+            "suggested_quantity": suggested_quantity,
+            "suggested_value": round(suggested_value, 2),
+            "status": status,
+        })
+
+    summary["stock_value"] = round(summary["stock_value"], 2)
+    summary["suggested_purchase_value"] = round(summary["suggested_purchase_value"], 2)
+    rows.sort(key=lambda row: (
+        {"NEGATIVO": 0, "ZERADO": 1, "BAIXO": 2, "SEM_VENDA": 3, "NORMAL": 4}.get(row["status"], 5),
+        row["name"].lower(),
+    ))
+    return {
+        "period_days": period_days,
+        "generated_at": datetime.utcnow(),
+        "summary": summary,
+        "items": rows,
+    }
+
+
+@app.put("/api/products/{product_id}/minimum-stock")
+def update_product_minimum_stock(
+    product_id: int,
+    company_id: int,
+    data: dict,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    product = db.query(Product).filter(
+        Product.id == product_id,
+        Product.tenant_id == user.tenant_id,
+        Product.company_id == company_id,
+    ).first()
+    if not product:
+        raise HTTPException(404, "Produto não encontrado")
+    try:
+        minimum_stock = int(data.get("minimum_stock", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Estoque mínimo inválido")
+    if minimum_stock < 0:
+        raise HTTPException(400, "O estoque mínimo não pode ser negativo")
+    product.minimum_stock = minimum_stock
+    db.commit()
+    return {"id": product.id, "minimum_stock": product.minimum_stock}
 
 @app.get("/api/dashboard")
 def dashboard(
