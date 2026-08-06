@@ -1860,6 +1860,7 @@ def health():
 from app.models import SefazDistributionConfig, SefazDistributionDocument
 from app.services.sefaz_distribution import load_certificate_info, query_distribution, query_by_access_key, summarize_document
 from app.services.sefaz_import import import_sefaz_document
+from app.services.sefaz_manifestation import manifest_science
 
 UF_CODES = {
     "RO": 11, "AC": 12, "AM": 13, "RR": 14, "PA": 15, "AP": 16, "TO": 17,
@@ -1903,7 +1904,7 @@ def sefaz_config(
     pending = db.query(func.count(SefazDistributionDocument.id)).filter(
         SefazDistributionDocument.tenant_id == user.tenant_id,
         SefazDistributionDocument.company_id == company_id,
-        SefazDistributionDocument.status.in_(["RECEBIDO", "AGUARDANDO_MANIFESTACAO"]),
+        SefazDistributionDocument.status.in_(["RECEBIDO", "AGUARDANDO_MANIFESTACAO", "MANIFESTADO_AGUARDANDO_XML"]),
     ).scalar() or 0
     imported = db.query(func.count(SefazDistributionDocument.id)).filter(
         SefazDistributionDocument.tenant_id == user.tenant_id,
@@ -2326,6 +2327,192 @@ def sefaz_query_key(
         "detail": detail,
     }
 
+
+@app.post("/api/sefaz/manifest-pending")
+def sefaz_manifest_pending(
+    company_id: int,
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    company = db.query(Company).filter(
+        Company.id == company_id,
+        Company.tenant_id == user.tenant_id,
+    ).first()
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+
+    fiscal = db.query(FiscalConfig).filter(
+        FiscalConfig.tenant_id == user.tenant_id,
+        FiscalConfig.company_id == company_id,
+    ).first()
+    if not fiscal or not fiscal.certificate_path:
+        raise HTTPException(400, "Cadastre o certificado A1")
+
+    config = db.query(SefazDistributionConfig).filter(
+        SefazDistributionConfig.tenant_id == user.tenant_id,
+        SefazDistributionConfig.company_id == company_id,
+    ).first()
+    if not config:
+        raise HTTPException(
+            400,
+            "Salve a configuração da SEFAZ primeiro",
+        )
+
+    limit = max(1, min(int(limit or 10), 20))
+    rows = db.query(SefazDistributionDocument).filter(
+        SefazDistributionDocument.tenant_id == user.tenant_id,
+        SefazDistributionDocument.company_id == company_id,
+        SefazDistributionDocument.status.in_([
+            "AGUARDANDO_MANIFESTACAO",
+            "MANIFESTADO_AGUARDANDO_XML",
+        ]),
+    ).order_by(
+        SefazDistributionDocument.id.asc()
+    ).limit(limit).all()
+
+    password = _decrypt_secret(
+        fiscal.certificate_password_encrypted
+    )
+    manifested = 0
+    xml_released = 0
+    imported = 0
+    waiting = 0
+    errors = []
+
+    folder = (
+        Path(__file__).resolve().parent.parent
+        / "uploads"
+        / "sefaz"
+        / str(user.tenant_id)
+        / str(company_id)
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+
+    for row in rows:
+        key = re.sub(r"\D", "", row.access_key or "")
+        if len(key) != 44:
+            errors.append({
+                "id": row.id,
+                "error": "Chave inválida no resumo",
+            })
+            continue
+
+        try:
+            if row.status == "AGUARDANDO_MANIFESTACAO":
+                event = manifest_science(
+                    company.cnpj,
+                    key,
+                    config.environment,
+                    fiscal.certificate_path,
+                    password,
+                )
+                if not event.get("accepted"):
+                    errors.append({
+                        "id": row.id,
+                        "code": event.get("status_code"),
+                        "error": event.get("status_message"),
+                    })
+                    continue
+                row.status = "MANIFESTADO_AGUARDANDO_XML"
+                db.commit()
+                manifested += 1
+
+            result = query_by_access_key(
+                company.cnpj,
+                UF_CODES.get(
+                    (company.state or "").upper(),
+                    35,
+                ),
+                key,
+                config.environment,
+                fiscal.certificate_path,
+                password,
+            )
+
+            full_item = None
+            full_summary = None
+            for item in result.get("documents", []):
+                summary = summarize_document(item["xml"])
+                if summary.get("document_type") != "RESNFE":
+                    full_item = item
+                    full_summary = summary
+                    break
+
+            if full_item is None:
+                waiting += 1
+                continue
+
+            xml_path = folder / (
+                f"{full_item.get('nsu') or row.nsu}_"
+                f"{uuid.uuid4().hex}.xml"
+            )
+            xml_path.write_bytes(full_item["xml"])
+
+            row.nsu = full_item.get("nsu") or row.nsu
+            row.schema_name = full_item.get("schema", "")
+            row.document_type = full_summary.get(
+                "document_type",
+                "PROCNFE",
+            )
+            row.access_key = (
+                full_summary.get("access_key") or key
+            )
+            row.issuer_name = full_summary.get(
+                "issuer_name",
+                "",
+            )
+            row.issuer_document = full_summary.get(
+                "issuer_document",
+                "",
+            )
+            row.issue_date = full_summary.get("issue_date")
+            row.total_value = full_summary.get(
+                "total_value",
+                Decimal("0"),
+            )
+            row.xml_path = str(xml_path)
+            row.status = "RECEBIDO"
+            db.commit()
+            xml_released += 1
+
+            if config.automatic_import:
+                output = import_sefaz_document(
+                    db,
+                    row,
+                    user.tenant_id,
+                    company_id,
+                )
+                if output.get("ok") or output.get("duplicate"):
+                    imported += 1
+        except Exception as exc:
+            db.rollback()
+            errors.append({
+                "id": row.id,
+                "error": str(exc)[:500],
+            })
+
+    remaining = db.query(
+        func.count(SefazDistributionDocument.id)
+    ).filter(
+        SefazDistributionDocument.tenant_id == user.tenant_id,
+        SefazDistributionDocument.company_id == company_id,
+        SefazDistributionDocument.status.in_([
+            "AGUARDANDO_MANIFESTACAO",
+            "MANIFESTADO_AGUARDANDO_XML",
+        ]),
+    ).scalar() or 0
+
+    return {
+        "ok": True,
+        "processed": len(rows),
+        "manifested": manifested,
+        "xml_released": xml_released,
+        "imported": imported,
+        "waiting": waiting,
+        "remaining": int(remaining),
+        "errors": errors,
+    }
 
 @app.get("/api/sefaz/documents")
 def sefaz_documents(
