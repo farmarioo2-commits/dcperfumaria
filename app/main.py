@@ -22,6 +22,7 @@ from app.db.session import Base, engine, get_db
 from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, User
 from app.services.gmail_nfe_import import gmail_is_configured, sync_once
 from app.services.ai_assistant import answer_question, build_company_context
+from app.services.company_registry import extract_certificate_company, fetch_company_registry
 
 Base.metadata.create_all(bind=engine)
 
@@ -953,6 +954,127 @@ async def upload_fiscal_certificate(
         "subject": info.subject,
         "issuer": info.issuer,
         "valid_until": info.valid_until,
+    }
+
+
+@app.post("/api/companies/{company_id}/fill-from-certificate")
+async def fill_company_from_certificate(
+    company_id: int,
+    password: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    company = db.query(Company).filter(
+        Company.id == company_id,
+        Company.tenant_id == user.tenant_id,
+    ).first()
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+    if not file.filename or not file.filename.lower().endswith((".pfx", ".p12")):
+        raise HTTPException(400, "Envie um certificado A1 .pfx ou .p12")
+
+    target = CERT_DIR / f"{user.tenant_id}_{company_id}_{uuid.uuid4().hex}.p12"
+    target.write_bytes(await file.read())
+
+    try:
+        certificate = extract_certificate_company(str(target), password)
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, f"Certificado A1 inválido ou senha incorreta: {exc}")
+
+    if certificate.valid_until < datetime.utcnow():
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, "O certificado A1 está vencido")
+
+    current_cnpj = re.sub(r"\D", "", company.cnpj or "")
+    if current_cnpj and current_cnpj != certificate.cnpj:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            409,
+            "O certificado pertence a outro CNPJ. Selecione a empresa correta antes de continuar.",
+        )
+
+    warning = ""
+    try:
+        registry = fetch_company_registry(certificate.cnpj)
+    except Exception as exc:
+        registry = {
+            "cnpj": certificate.cnpj,
+            "legal_name": certificate.legal_name,
+            "trade_name": certificate.legal_name,
+            "state_registration": "",
+            "registry_source": "Certificado A1",
+            "registry_status": "",
+        }
+        warning = str(exc)
+
+    expected_cnpj = re.sub(r"\D", "", registry.get("cnpj") or certificate.cnpj)
+    if expected_cnpj and expected_cnpj != certificate.cnpj:
+        target.unlink(missing_ok=True)
+        raise HTTPException(502, "A consulta cadastral retornou um CNPJ diferente do certificado")
+
+    fields = (
+        "trade_name",
+        "legal_name",
+        "cnpj",
+        "state_registration",
+        "email",
+        "phone",
+        "address",
+        "number",
+        "complement",
+        "district",
+        "city",
+        "state",
+        "zip_code",
+    )
+    registry["cnpj"] = certificate.cnpj
+    registry["legal_name"] = registry.get("legal_name") or certificate.legal_name
+    registry["trade_name"] = registry.get("trade_name") or registry["legal_name"]
+    for field in fields:
+        value = str(registry.get(field) or "").strip()
+        if value:
+            setattr(company, field, value)
+
+    fiscal = db.query(FiscalConfig).filter(
+        FiscalConfig.tenant_id == user.tenant_id,
+        FiscalConfig.company_id == company_id,
+    ).first()
+    if not fiscal:
+        fiscal = FiscalConfig(tenant_id=user.tenant_id, company_id=company_id)
+        db.add(fiscal)
+        db.flush()
+
+    old_path = Path(fiscal.certificate_path) if fiscal.certificate_path else None
+    fiscal.certificate_path = str(target)
+    fiscal.certificate_password_encrypted = _encrypt_secret(password)
+    fiscal.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(company)
+
+    if old_path and old_path != target:
+        old_path.unlink(missing_ok=True)
+
+    company_payload = {
+        field: getattr(company, field)
+        for field in fields
+    }
+    return {
+        "ok": True,
+        "company": company_payload,
+        "certificate": {
+            "cnpj": certificate.cnpj,
+            "subject": certificate.subject,
+            "issuer": certificate.issuer,
+            "serial_number": certificate.serial_number,
+            "valid_from": certificate.valid_from,
+            "valid_until": certificate.valid_until,
+        },
+        "registry_source": registry.get("registry_source", ""),
+        "registry_status": registry.get("registry_status", ""),
+        "state_registration_found": bool(company.state_registration),
+        "warning": warning,
     }
 
 
