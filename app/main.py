@@ -3444,6 +3444,80 @@ async def pagbank_webhook(
     return {"ok": True}
 
 
+@app.post("/api/pagbank/refresh-pending")
+def pagbank_refresh_pending(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    config = _pagbank_get_config(
+        db,
+        user.tenant_id,
+        company_id,
+    )
+    token = _decrypt_secret(config.token_encrypted)
+    rows = db.query(PagBankPayment).filter(
+        PagBankPayment.tenant_id == user.tenant_id,
+        PagBankPayment.company_id == company_id,
+    ).order_by(PagBankPayment.id.desc()).limit(100).all()
+
+    updated = 0
+    paid = 0
+    errors = []
+    for row in rows:
+        if pagbank_paid_status(row.status):
+            continue
+        try:
+            payload = pagbank_get_order(
+                config.environment,
+                token,
+                row.order_id,
+            )
+            details = pagbank_extract_payment_details(payload)
+            old_status = row.status
+            row.status = details["status"]
+            row.charge_id = details["charge_id"] or row.charge_id
+            row.qr_code_text = details["qr_code_text"] or row.qr_code_text
+            row.qr_code_link = details["qr_code_link"] or row.qr_code_link
+            row.boleto_barcode = (
+                details["boleto_barcode"] or row.boleto_barcode
+            )
+            row.boleto_pdf = details["boleto_pdf"] or row.boleto_pdf
+            row.raw_json = json.dumps(
+                payload,
+                ensure_ascii=False,
+                default=str,
+            )
+            row.updated_at = datetime.utcnow()
+            if old_status != row.status:
+                updated += 1
+
+            if pagbank_paid_status(row.status):
+                row.paid_at = row.paid_at or datetime.utcnow()
+                paid += 1
+                if row.receivable_id:
+                    receivable = db.get(
+                        Receivable,
+                        row.receivable_id,
+                    )
+                    if receivable:
+                        receivable.status = "RECEBIDO"
+                        receivable.received_date = date.today()
+        except Exception as exc:
+            errors.append({
+                "payment_id": row.id,
+                "error": str(exc)[:300],
+            })
+
+    db.commit()
+    return {
+        "ok": True,
+        "checked": len(rows),
+        "updated": updated,
+        "paid": paid,
+        "errors": errors,
+    }
+
 @app.get("/api/pagbank/summary")
 def pagbank_summary(
     company_id: int,
