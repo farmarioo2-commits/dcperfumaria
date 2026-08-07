@@ -1789,6 +1789,13 @@ def dashboard(
     today = date.today()
     month_start = today.replace(day=1)
 
+    company = db.query(Company).filter(
+        Company.id == company_id,
+        Company.tenant_id == user.tenant_id,
+    ).first()
+    if not company:
+        raise HTTPException(404, "Empresa não encontrada")
+
     products = db.query(Product).filter(
         Product.tenant_id == user.tenant_id,
         Product.company_id == company_id,
@@ -1801,15 +1808,16 @@ def dashboard(
         stock = stock_of(db, user.tenant_id, company_id, product.id)
         stock_units += stock
         stock_value += stock * float(product.unit_cost or 0)
-        if stock <= (product.minimum_stock or 0):
+        minimum = int(product.minimum_stock or 0)
+        if minimum > 0 and stock <= minimum:
             low_stock_items.append({
                 "id": product.id,
                 "name": product.name,
                 "stock": stock,
-                "minimum_stock": product.minimum_stock or 0,
+                "minimum_stock": minimum,
             })
 
-    sales_month_query = db.query(
+    sales_month_total, sales_month_count = db.query(
         func.coalesce(func.sum(Sale.total), 0),
         func.count(Sale.id),
     ).filter(
@@ -1820,7 +1828,7 @@ def dashboard(
         Sale.status == "CONCLUÍDA",
     ).one()
 
-    sales_today_query = db.query(
+    sales_today_total, sales_today_count = db.query(
         func.coalesce(func.sum(Sale.total), 0),
         func.count(Sale.id),
     ).filter(
@@ -1830,29 +1838,42 @@ def dashboard(
         Sale.status == "CONCLUÍDA",
     ).one()
 
-    payables_open = db.query(func.coalesce(func.sum(Payable.value), 0)).filter(
+    payables_rows = db.query(Payable).filter(
         Payable.tenant_id == user.tenant_id,
         Payable.company_id == company_id,
         Payable.status != "PAGO",
-    ).scalar() or 0
+    ).all()
+    payables_open = sum((Decimal(str(row.value or 0)) for row in payables_rows), Decimal("0"))
+    overdue_payables = [row for row in payables_rows if row.due_date and row.due_date < today]
+    next_7_payables = [
+        row for row in payables_rows
+        if row.due_date and 0 <= (row.due_date - today).days <= 7
+    ]
 
-    receivables_open = db.query(func.coalesce(func.sum(Receivable.value), 0)).filter(
+    receivable_rows = db.query(Receivable).filter(
         Receivable.tenant_id == user.tenant_id,
         Receivable.company_id == company_id,
         Receivable.status == "EM ABERTO",
+    ).all()
+    receivables_open = sum(
+        (Decimal(str(row.value or 0)) for row in receivable_rows),
+        Decimal("0"),
+    )
+    overdue_receivables = [
+        row for row in receivable_rows
+        if row.due_date and row.due_date < today
+    ]
+
+    received_month = db.query(
+        func.coalesce(func.sum(Receivable.value), 0)
+    ).filter(
+        Receivable.tenant_id == user.tenant_id,
+        Receivable.company_id == company_id,
+        Receivable.status == "RECEBIDO",
+        Receivable.received_date >= month_start,
+        Receivable.received_date <= today,
     ).scalar() or 0
 
-    overdue_query = db.query(
-        func.coalesce(func.sum(Payable.value), 0),
-        func.count(Payable.id),
-    ).filter(
-        Payable.tenant_id == user.tenant_id,
-        Payable.company_id == company_id,
-        Payable.status != "PAGO",
-        Payable.due_date < today,
-    ).one()
-
-    # Série dos últimos seis meses, compatível com SQLite e PostgreSQL.
     sales_chart = []
     cursor_year = today.year
     cursor_month = today.month
@@ -1919,45 +1940,135 @@ def dashboard(
         Sale.id.desc(),
     ).limit(6).all()
 
+    # Integrações: todas protegidas para que um módulo opcional nunca derrube o Dashboard.
     sefaz_pending = 0
     try:
+        from app.models import SefazDistributionDocument
         sefaz_pending = db.query(func.count(SefazDistributionDocument.id)).filter(
             SefazDistributionDocument.tenant_id == user.tenant_id,
             SefazDistributionDocument.company_id == company_id,
-            SefazDistributionDocument.status == "RECEBIDO",
+            SefazDistributionDocument.status.in_([
+                "RECEBIDO",
+                "AGUARDANDO_MANIFESTACAO",
+                "MANIFESTADO_AGUARDANDO_XML",
+            ]),
         ).scalar() or 0
     except Exception:
         db.rollback()
 
+    dda_connected = False
+    dda_open_count = 0
+    dda_open_value = Decimal("0")
+    try:
+        dda_connected = db.query(DdaConnector).filter(
+            DdaConnector.tenant_id == user.tenant_id,
+            DdaConnector.company_id == company_id,
+            DdaConnector.active.is_(True),
+        ).count() > 0
+        dda_rows = db.query(DdaBoleto).filter(
+            DdaBoleto.tenant_id == user.tenant_id,
+            DdaBoleto.company_id == company_id,
+            ~DdaBoleto.status.in_(["PAGO", "CANCELADO", "IGNORADO"]),
+        ).all()
+        dda_open_count = len(dda_rows)
+        dda_open_value = sum(
+            (Decimal(str(row.amount or 0)) for row in dda_rows),
+            Decimal("0"),
+        )
+    except Exception:
+        db.rollback()
+
+    pagbank_connected = False
+    pagbank_pending_count = 0
+    try:
+        pagbank_connected = db.query(PagBankConfig).filter(
+            PagBankConfig.tenant_id == user.tenant_id,
+            PagBankConfig.company_id == company_id,
+            PagBankConfig.active.is_(True),
+        ).count() > 0
+        paid_statuses = ["PAID", "AUTHORIZED", "AVAILABLE", "IN_ANALYSIS_APPROVED"]
+        pagbank_pending_count = db.query(PagBankPayment).filter(
+            PagBankPayment.tenant_id == user.tenant_id,
+            PagBankPayment.company_id == company_id,
+            ~PagBankPayment.status.in_(paid_statuses),
+        ).count()
+    except Exception:
+        db.rollback()
+
+    shopee_connected_shops = 0
+    try:
+        shopee_connected_shops = db.query(ShopeeShop).filter(
+            ShopeeShop.tenant_id == user.tenant_id,
+            ShopeeShop.company_id == company_id,
+            ShopeeShop.connected.is_(True),
+        ).count()
+    except Exception:
+        db.rollback()
+
+    bank_pending_count = 0
+    try:
+        bank_pending_count = db.query(BankTransaction).filter(
+            BankTransaction.tenant_id == user.tenant_id,
+            BankTransaction.company_id == company_id,
+            BankTransaction.reconciliation_status == "PENDENTE",
+        ).count()
+    except Exception:
+        db.rollback()
+
     return {
-        # Campos antigos preservados para compatibilidade.
-        "products": len(products),
-        "stock_units": stock_units,
-        "stock_value": stock_value,
-        "low_stock": len(low_stock_items),
-        "sales_month": float(sales_month_query[0] or 0),
-        "payables_month": float(payables_open),
-        "receivables_open": float(receivables_open),
-        "received_month": float(
-            db.query(func.coalesce(func.sum(Receivable.value), 0)).filter(
-                Receivable.tenant_id == user.tenant_id,
-                Receivable.company_id == company_id,
-                Receivable.status == "RECEBIDO",
-                Receivable.received_date >= month_start,
-                Receivable.received_date <= today,
-            ).scalar() or 0
+        "company_name": company.trade_name or company.legal_name or "Empresa",
+        "has_operation": bool(
+            products
+            or int(sales_month_count or 0)
+            or payables_rows
+            or receivable_rows
         ),
 
-        # Dashboard inteligente.
-        "sales_today": float(sales_today_query[0] or 0),
-        "sales_today_count": int(sales_today_query[1] or 0),
-        "sales_month_count": int(sales_month_query[1] or 0),
-        "payables_open": float(payables_open),
-        "overdue_payables_count": int(overdue_query[1] or 0),
-        "overdue_payables_value": float(overdue_query[0] or 0),
-        "sefaz_pending": int(sefaz_pending),
-        "sales_chart": sales_chart,
+        "products": len(products),
+        "stock_units": int(stock_units),
+        "stock_value": float(stock_value),
+        "low_stock": len(low_stock_items),
         "low_stock_items": low_stock_items[:8],
+
+        "sales_today": float(sales_today_total or 0),
+        "sales_today_count": int(sales_today_count or 0),
+        "sales_month": float(sales_month_total or 0),
+        "sales_month_count": int(sales_month_count or 0),
+        "sales_chart": sales_chart,
+
+        "payables_open": float(payables_open),
+        "payables_count": len(payables_rows),
+        "overdue_payables_count": len(overdue_payables),
+        "overdue_payables_value": float(sum(
+            (Decimal(str(row.value or 0)) for row in overdue_payables),
+            Decimal("0"),
+        )),
+        "payables_next_7_days_count": len(next_7_payables),
+        "payables_next_7_days_value": float(sum(
+            (Decimal(str(row.value or 0)) for row in next_7_payables),
+            Decimal("0"),
+        )),
+
+        "receivables_open": float(receivables_open),
+        "receivables_count": len(receivable_rows),
+        "overdue_receivables_count": len(overdue_receivables),
+        "overdue_receivables_value": float(sum(
+            (Decimal(str(row.value or 0)) for row in overdue_receivables),
+            Decimal("0"),
+        )),
+        "received_month": float(received_month),
+        "open_balance": float(receivables_open - payables_open),
+
+        "sefaz_pending": int(sefaz_pending),
+        "dda_connected": bool(dda_connected),
+        "dda_open_count": int(dda_open_count),
+        "dda_open_value": float(dda_open_value),
+        "pagbank_connected": bool(pagbank_connected),
+        "pagbank_pending_count": int(pagbank_pending_count),
+        "shopee_connected": shopee_connected_shops > 0,
+        "shopee_connected_shops": int(shopee_connected_shops),
+        "bank_pending_count": int(bank_pending_count),
+
         "top_products": [
             {
                 "name": row.name,
