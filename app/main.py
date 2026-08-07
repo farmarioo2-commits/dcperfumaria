@@ -8,6 +8,7 @@ from threading import Lock
 from decimal import Decimal
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import case, func
@@ -3659,6 +3660,139 @@ def pagbank_summary(
         "pix_count": sum(1 for row in rows if row.payment_type == "PIX"),
         "boleto_count": sum(1 for row in rows if row.payment_type == "BOLETO"),
     }
+
+# --- Portal de revisão Shopee ---
+SHOPEE_REVIEW_USER = "GestaoFacilERP"
+SHOPEE_REVIEW_PASSWORD = "Gestao@2026"
+
+_SHOPEE_REVIEW_LOGIN_HTML = r"""
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GestaoFacilERP - Acesso de revisão</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f4f5f7;color:#171717}
+    .wrap{min-height:100vh;display:grid;grid-template-columns:1.05fr .95fr}
+    .brand{background:linear-gradient(145deg,#101010,#2b1a0d);color:#fff;padding:64px;display:flex;align-items:center}
+    .brandBox{max-width:620px}.logo{width:88px;height:88px;border-radius:24px;background:#111;border:1px solid #3b3b3b;display:flex;align-items:center;justify-content:center;font-size:38px;font-weight:900;color:#ff7a00;box-shadow:0 18px 45px #0007}
+    h1{font-size:46px;margin:24px 0 10px}.orange{color:#ff7a00}.subtitle{font-size:18px;color:#d3d3d3;line-height:1.6}
+    .chips{display:flex;gap:10px;flex-wrap:wrap;margin-top:28px}.chip{padding:9px 13px;border:1px solid #ffffff22;border-radius:999px;color:#e7e7e7;background:#ffffff0b}
+    .loginSide{padding:40px;display:flex;align-items:center;justify-content:center}.card{width:min(460px,100%);background:#fff;border-radius:22px;padding:34px;box-shadow:0 20px 60px #00000014;border:1px solid #e8e8e8}
+    .eyebrow{font-size:12px;letter-spacing:.12em;font-weight:800;color:#ff7a00}.card h2{font-size:28px;margin:8px 0 6px}.muted{color:#747474;margin-bottom:24px;line-height:1.5}
+    label{display:block;font-size:13px;font-weight:700;margin:14px 0 7px}.input{width:100%;height:48px;border:1px solid #d9d9d9;border-radius:11px;padding:0 13px;font-size:15px;outline:none}.input:focus{border-color:#ff7a00;box-shadow:0 0 0 3px #ff7a0018}
+    button{width:100%;height:50px;border:0;border-radius:12px;background:#ff7a00;color:#111;font-weight:900;font-size:15px;margin-top:20px;cursor:pointer}.note{margin-top:18px;padding:13px;background:#fff7ed;border-radius:12px;color:#805119;font-size:12px;line-height:1.5}
+    .error{padding:10px 12px;border-radius:10px;background:#fff0f0;color:#b42318;font-size:13px;margin-bottom:14px}
+    @media(max-width:850px){.wrap{grid-template-columns:1fr}.brand{display:none}.loginSide{padding:20px}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="brand">
+      <div class="brandBox">
+        <div class="logo">GF</div>
+        <h1>Gestão <span class="orange">Fácil</span></h1>
+        <div class="subtitle">ERP empresarial para estoque, vendas, financeiro, fiscal e integrações com marketplaces.</div>
+        <div class="chips">
+          <span class="chip">Estoque</span><span class="chip">Vendas</span><span class="chip">Financeiro</span>
+          <span class="chip">NF-e / SEFAZ</span><span class="chip">Shopee</span><span class="chip">DDA / Bancos</span>
+        </div>
+      </div>
+    </section>
+    <section class="loginSide">
+      <form class="card" method="post" action="/shopee-review/login">
+        <div class="eyebrow">AMBIENTE DE REVISÃO</div>
+        <h2>Acessar GestaoFacilERP</h2>
+        <div class="muted">Acesso preparado exclusivamente para análise técnica da Shopee Open Platform.</div>
+        {error}
+        <label>Usuário</label>
+        <input class="input" name="username" autocomplete="username" required placeholder="Digite o usuário de teste">
+        <label>Senha</label>
+        <input class="input" type="password" name="password" autocomplete="current-password" required placeholder="Digite a senha de teste">
+        <button type="submit">Entrar no sistema</button>
+        <div class="note">Este ambiente demonstra a interface e os módulos do ERP sem expor dados sensíveis da operação real.</div>
+      </form>
+    </section>
+  </div>
+</body>
+</html>
+"""
+
+_SHOPEE_REVIEW_APP_HTML = r"""
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GestaoFacilERP - Revisão Shopee</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f4f5f7;color:#151515}
+    .shell{display:grid;grid-template-columns:230px 1fr;min-height:100vh}.side{background:#111;color:#eee;padding:20px 15px}.brand{display:flex;gap:10px;align-items:center;font-weight:900;font-size:18px;margin-bottom:28px}.mark{background:#ff7a00;color:#111;border-radius:10px;width:34px;height:34px;display:grid;place-items:center}
+    .group{font-size:10px;color:#777;letter-spacing:.12em;margin:21px 10px 8px}.nav{padding:11px 12px;border-radius:10px;margin:4px 0;color:#ccc}.nav.on{background:#412612;color:#fff;border-left:3px solid #ff7a00}
+    main{padding:26px}.top{display:flex;justify-content:space-between;align-items:center}.badge{padding:8px 12px;border-radius:999px;background:#eaf8ef;color:#15723b;font-weight:800;font-size:12px}
+    h1{margin:18px 0 4px;font-size:30px}.muted{color:#727272}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:22px 0}.card{background:#fff;border:1px solid #e5e5e5;border-radius:16px;padding:18px;box-shadow:0 8px 25px #00000008}.k{font-size:13px;color:#777}.v{font-size:25px;font-weight:900;margin-top:7px}.orange{color:#ff7a00}
+    .two{display:grid;grid-template-columns:1.35fr .65fr;gap:14px}.module{min-height:245px}.row{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #eee}.ok{color:#138a4b;font-weight:800}.warn{color:#b56c00;font-weight:800}
+    .flow{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.pill{background:#f6f6f6;padding:10px 12px;border-radius:10px;font-size:13px;border:1px solid #ededed}.footer{margin-top:16px;font-size:12px;color:#888}
+    @media(max-width:900px){.shell{grid-template-columns:1fr}.side{display:none}.grid{grid-template-columns:1fr 1fr}.two{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><div class="mark">GF</div>Gestão Fácil</div>
+    <div class="group">GERAL</div><div class="nav on">Dashboard</div>
+    <div class="group">ESTOQUE</div><div class="nav">Produtos</div><div class="nav">Estoque</div><div class="nav">Estoque inteligente</div>
+    <div class="group">FINANCEIRO</div><div class="nav">Vendas</div><div class="nav">Conciliação Bancária</div><div class="nav">DDA Inteligente</div><div class="nav">Contas a pagar</div><div class="nav">Contas a receber</div>
+    <div class="group">MARKETPLACES</div><div class="nav">Shopee</div>
+  </aside>
+  <main>
+    <div class="top"><div><b>GestaoFacilERP</b><div class="muted" style="font-size:12px">Ambiente de revisão técnica</div></div><span class="badge">● Ambiente disponível</span></div>
+    <h1>Dashboard</h1><div class="muted">Visão consolidada da operação e das integrações.</div>
+    <section class="grid">
+      <div class="card"><div class="k">Vendas hoje</div><div class="v">R$ 0,00</div><div class="muted">Ambiente de demonstração</div></div>
+      <div class="card"><div class="k">Pedidos Shopee</div><div class="v orange">Integração</div><div class="muted">Open API V2.0</div></div>
+      <div class="card"><div class="k">Estoque</div><div class="v">Sincronizado</div><div class="muted">Produtos e quantidades</div></div>
+      <div class="card"><div class="k">Fiscal</div><div class="v">SEFAZ</div><div class="muted">NF-e e documentos</div></div>
+    </section>
+    <section class="two">
+      <div class="card module">
+        <h3>Fluxo planejado da integração Shopee</h3>
+        <div class="flow">
+          <span class="pill">1. Autorizar loja</span><span class="pill">2. Importar pedidos</span>
+          <span class="pill">3. Sincronizar produtos</span><span class="pill">4. Atualizar estoque</span>
+          <span class="pill">5. Consultar logística</span><span class="pill">6. Atualizar status</span>
+        </div>
+        <div class="footer">A integração utiliza autenticação e autorização da Shopee Open Platform e é destinada às lojas próprias da empresa.</div>
+      </div>
+      <div class="card module">
+        <h3>Módulos</h3>
+        <div class="row"><span>Produtos</span><span class="ok">Disponível</span></div>
+        <div class="row"><span>Estoque</span><span class="ok">Disponível</span></div>
+        <div class="row"><span>Pedidos</span><span class="ok">Disponível</span></div>
+        <div class="row"><span>Shopee</span><span class="warn">Em integração</span></div>
+        <div class="row"><span>Financeiro</span><span class="ok">Disponível</span></div>
+      </div>
+    </section>
+  </main>
+</div>
+</body>
+</html>
+"""
+
+@app.get("/shopee-review", response_class=HTMLResponse, include_in_schema=False)
+def shopee_review_login():
+    return HTMLResponse(_SHOPEE_REVIEW_LOGIN_HTML.format(error=""))
+
+@app.post("/shopee-review/login", response_class=HTMLResponse, include_in_schema=False)
+def shopee_review_login_submit(
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    if username == SHOPEE_REVIEW_USER and password == SHOPEE_REVIEW_PASSWORD:
+        return HTMLResponse(_SHOPEE_REVIEW_APP_HTML)
+    error = '<div class="error">Usuário ou senha inválidos.</div>'
+    return HTMLResponse(_SHOPEE_REVIEW_LOGIN_HTML.format(error=error), status_code=401)
 
 @app.get("/health")
 def health():
