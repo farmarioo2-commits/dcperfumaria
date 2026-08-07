@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from datetime import date
 from threading import Lock
 from decimal import Decimal
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
@@ -20,13 +20,14 @@ import json
 
 from app.core.security import create_token, decode_token, hash_password, verify_password
 from app.db.session import Base, engine, get_db
-from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, ShopeeShop, ShopeeOrder, ShopeeSyncLog, DdaConnector, DdaBoleto, DdaSyncLog, BankStatementImport, BankTransaction, BankReconciliationLog, User
+from app.models import Company, Customer, FiscalConfig, FiscalDocument, GmailImportLog, ImportedNfe, ImportedNfeItem, ImportedPdf, NfeInstallment, Payable, Product, Receivable, Sale, SaleItem, StockMovement, Supplier, Tenant, ShopeeShop, ShopeeOrder, ShopeeSyncLog, DdaConnector, DdaBoleto, DdaSyncLog, BankStatementImport, BankTransaction, BankReconciliationLog, PagBankConfig, PagBankPayment, PagBankWebhookLog, User
 from app.services.gmail_nfe_import import gmail_is_configured, sync_once
 from app.services.ai_assistant import answer_question, build_company_context
 from app.services.shopee_api import authorization_url as shopee_authorization_url, configured as shopee_configured, exchange_code as shopee_exchange_code, refresh_token as shopee_refresh_token, shop_get as shopee_shop_get
 from app.services.dda_connectors import SUPPORTED_PROVIDERS as DDA_SUPPORTED_PROVIDERS, analyze_boleto as dda_analyze_boleto, fetch_boletos as dda_fetch_boletos, provider_catalog as dda_provider_catalog
 from app.services.bank_reconciliation import analyze_match as bank_analyze_match, file_hash as bank_file_hash, parse_statement as bank_parse_statement
 from app.services.company_registry import extract_certificate_company, fetch_company_registry
+from app.services.pagbank_api import create_boleto_order as pagbank_create_boleto_order, create_pix_order as pagbank_create_pix_order, extract_payment_details as pagbank_extract_payment_details, get_order as pagbank_get_order, paid_status as pagbank_paid_status, test_connection as pagbank_test_connection
 
 Base.metadata.create_all(bind=engine)
 
@@ -2993,6 +2994,485 @@ def banking_analysis(
             f"{sum(1 for row in rows if row.match_score < 50)} sem correspondência."
         ),
         "alerts": alerts,
+    }
+
+class PagBankConfigIn(BaseModel):
+    environment: str = "SANDBOX"
+    token: str = ""
+    active: bool = True
+
+
+class PagBankPixIn(BaseModel):
+    receivable_id: int | None = None
+    reference_id: str = ""
+    amount: Decimal
+    customer_name: str
+    customer_email: EmailStr
+    customer_tax_id: str
+    expiration_minutes: int = 30
+
+
+class PagBankBoletoIn(BaseModel):
+    receivable_id: int | None = None
+    reference_id: str = ""
+    amount: Decimal
+    due_date: date
+    customer_name: str
+    customer_email: EmailStr
+    customer_tax_id: str
+    phone_country: str = "55"
+    phone_area: str
+    phone_number: str
+    address_street: str
+    address_number: str
+    address_locality: str
+    address_city: str
+    address_region: str
+    address_postal_code: str
+
+
+def _pagbank_config_payload(row: PagBankConfig | None) -> dict:
+    if not row:
+        return {
+            "configured": False,
+            "environment": "SANDBOX",
+            "active": False,
+            "last_status": "NAO_CONFIGURADO",
+            "last_message": "",
+        }
+    return {
+        "configured": bool(row.token_encrypted),
+        "environment": row.environment,
+        "active": row.active,
+        "last_test_at": row.last_test_at,
+        "last_status": row.last_status,
+        "last_message": row.last_message,
+    }
+
+
+def _pagbank_payment_payload(row: PagBankPayment) -> dict:
+    return {
+        "id": row.id,
+        "reference_id": row.reference_id,
+        "order_id": row.order_id,
+        "charge_id": row.charge_id,
+        "payment_type": row.payment_type,
+        "customer_name": row.customer_name,
+        "customer_email": row.customer_email,
+        "customer_tax_id": row.customer_tax_id,
+        "amount": float(row.amount or 0),
+        "status": row.status,
+        "qr_code_text": row.qr_code_text,
+        "qr_code_link": row.qr_code_link,
+        "boleto_barcode": row.boleto_barcode,
+        "boleto_pdf": row.boleto_pdf,
+        "expires_at": row.expires_at,
+        "paid_at": row.paid_at,
+        "created_at": row.created_at,
+    }
+
+
+def _pagbank_get_config(
+    db: Session,
+    tenant_id: int,
+    company_id: int,
+) -> PagBankConfig:
+    row = db.query(PagBankConfig).filter(
+        PagBankConfig.tenant_id == tenant_id,
+        PagBankConfig.company_id == company_id,
+    ).first()
+    if not row or not row.token_encrypted:
+        raise HTTPException(400, "Configure o token do PagBank primeiro")
+    if not row.active:
+        raise HTTPException(400, "A integração PagBank está desativada")
+    return row
+
+
+@app.get("/api/pagbank/config")
+def pagbank_get_config(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    row = db.query(PagBankConfig).filter(
+        PagBankConfig.tenant_id == user.tenant_id,
+        PagBankConfig.company_id == company_id,
+    ).first()
+    return _pagbank_config_payload(row)
+
+
+@app.post("/api/pagbank/config")
+def pagbank_save_config(
+    company_id: int,
+    data: PagBankConfigIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    environment = data.environment.upper()
+    if environment not in {"SANDBOX", "PRODUCAO"}:
+        raise HTTPException(400, "Ambiente inválido")
+
+    row = db.query(PagBankConfig).filter(
+        PagBankConfig.tenant_id == user.tenant_id,
+        PagBankConfig.company_id == company_id,
+    ).first()
+    if not row:
+        row = PagBankConfig(
+            tenant_id=user.tenant_id,
+            company_id=company_id,
+        )
+        db.add(row)
+
+    row.environment = environment
+    if data.token.strip():
+        row.token_encrypted = _encrypt_secret(data.token.strip())
+    row.active = data.active
+    row.last_status = "CONFIGURADO" if row.token_encrypted else "SEM_TOKEN"
+    row.last_message = "Configuração PagBank atualizada."
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return _pagbank_config_payload(row)
+
+
+@app.post("/api/pagbank/test")
+def pagbank_test(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    row = _pagbank_get_config(
+        db,
+        user.tenant_id,
+        company_id,
+    )
+    token = _decrypt_secret(row.token_encrypted)
+    try:
+        result = pagbank_test_connection(row.environment, token)
+        row.last_test_at = datetime.utcnow()
+        row.last_status = "OK"
+        row.last_message = result["message"]
+        db.commit()
+        return result
+    except Exception as exc:
+        row.last_test_at = datetime.utcnow()
+        row.last_status = "ERRO"
+        row.last_message = str(exc)[:500]
+        db.commit()
+        raise HTTPException(502, str(exc))
+
+
+@app.post("/api/pagbank/pix")
+def pagbank_create_pix(
+    company_id: int,
+    data: PagBankPixIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    config = _pagbank_get_config(
+        db,
+        user.tenant_id,
+        company_id,
+    )
+    token = _decrypt_secret(config.token_encrypted)
+    reference_id = (
+        data.reference_id.strip()
+        or f"GF-{company_id}-{uuid.uuid4().hex[:16]}"
+    )
+    notification_url = str(
+        request.base_url
+    ).rstrip("/") + "/api/pagbank/webhook"
+
+    try:
+        payload = pagbank_create_pix_order(
+            environment=config.environment,
+            token=token,
+            reference_id=reference_id,
+            amount=data.amount,
+            customer_name=data.customer_name,
+            customer_email=str(data.customer_email),
+            customer_tax_id=re.sub(r"\D", "", data.customer_tax_id),
+            notification_url=notification_url,
+            expiration_minutes=max(5, min(data.expiration_minutes, 1440)),
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"PagBank: {exc}")
+
+    details = pagbank_extract_payment_details(payload)
+    row = PagBankPayment(
+        tenant_id=user.tenant_id,
+        company_id=company_id,
+        receivable_id=data.receivable_id,
+        reference_id=reference_id,
+        order_id=details["order_id"],
+        charge_id=details["charge_id"],
+        payment_type="PIX",
+        customer_name=data.customer_name,
+        customer_email=str(data.customer_email),
+        customer_tax_id=re.sub(r"\D", "", data.customer_tax_id),
+        amount=data.amount,
+        status=details["status"],
+        qr_code_text=details["qr_code_text"],
+        qr_code_link=details["qr_code_link"],
+        expires_at=datetime.utcnow() + timedelta(
+            minutes=max(5, min(data.expiration_minutes, 1440))
+        ),
+        raw_json=json.dumps(payload, ensure_ascii=False, default=str),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _pagbank_payment_payload(row)
+
+
+@app.post("/api/pagbank/boleto")
+def pagbank_create_boleto(
+    company_id: int,
+    data: PagBankBoletoIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    config = _pagbank_get_config(
+        db,
+        user.tenant_id,
+        company_id,
+    )
+    token = _decrypt_secret(config.token_encrypted)
+    reference_id = (
+        data.reference_id.strip()
+        or f"GF-BOL-{company_id}-{uuid.uuid4().hex[:12]}"
+    )
+    notification_url = str(
+        request.base_url
+    ).rstrip("/") + "/api/pagbank/webhook"
+
+    customer = {
+        "name": data.customer_name,
+        "email": str(data.customer_email),
+        "tax_id": re.sub(r"\D", "", data.customer_tax_id),
+        "phones": [
+            {
+                "country": re.sub(r"\D", "", data.phone_country),
+                "area": re.sub(r"\D", "", data.phone_area),
+                "number": re.sub(r"\D", "", data.phone_number),
+                "type": "MOBILE",
+            }
+        ],
+        "address": {
+            "street": data.address_street,
+            "number": data.address_number,
+            "locality": data.address_locality,
+            "city": data.address_city,
+            "region_code": data.address_region.upper(),
+            "country": "BRA",
+            "postal_code": re.sub(
+                r"\D", "", data.address_postal_code
+            ),
+        },
+    }
+    try:
+        payload = pagbank_create_boleto_order(
+            environment=config.environment,
+            token=token,
+            reference_id=reference_id,
+            amount=data.amount,
+            customer=customer,
+            due_date=data.due_date.isoformat(),
+            notification_url=notification_url,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"PagBank: {exc}")
+
+    details = pagbank_extract_payment_details(payload)
+    row = PagBankPayment(
+        tenant_id=user.tenant_id,
+        company_id=company_id,
+        receivable_id=data.receivable_id,
+        reference_id=reference_id,
+        order_id=details["order_id"],
+        charge_id=details["charge_id"],
+        payment_type="BOLETO",
+        customer_name=data.customer_name,
+        customer_email=str(data.customer_email),
+        customer_tax_id=re.sub(r"\D", "", data.customer_tax_id),
+        amount=data.amount,
+        status=details["status"],
+        boleto_barcode=details["boleto_barcode"],
+        boleto_pdf=details["boleto_pdf"],
+        expires_at=datetime.combine(
+            data.due_date,
+            datetime.min.time(),
+        ),
+        raw_json=json.dumps(payload, ensure_ascii=False, default=str),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _pagbank_payment_payload(row)
+
+
+@app.get("/api/pagbank/payments")
+def pagbank_list_payments(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(PagBankPayment).filter(
+        PagBankPayment.tenant_id == user.tenant_id,
+        PagBankPayment.company_id == company_id,
+    ).order_by(
+        PagBankPayment.id.desc()
+    ).limit(500).all()
+    return [_pagbank_payment_payload(row) for row in rows]
+
+
+@app.post("/api/pagbank/payments/{payment_id}/refresh")
+def pagbank_refresh_payment(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    row = db.query(PagBankPayment).filter(
+        PagBankPayment.id == payment_id,
+        PagBankPayment.tenant_id == user.tenant_id,
+    ).first()
+    if not row:
+        raise HTTPException(404, "Cobrança não encontrada")
+    config = _pagbank_get_config(
+        db,
+        user.tenant_id,
+        row.company_id,
+    )
+    token = _decrypt_secret(config.token_encrypted)
+    try:
+        payload = pagbank_get_order(
+            config.environment,
+            token,
+            row.order_id,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"PagBank: {exc}")
+
+    details = pagbank_extract_payment_details(payload)
+    row.status = details["status"]
+    row.charge_id = details["charge_id"] or row.charge_id
+    row.qr_code_text = details["qr_code_text"] or row.qr_code_text
+    row.qr_code_link = details["qr_code_link"] or row.qr_code_link
+    row.boleto_barcode = details["boleto_barcode"] or row.boleto_barcode
+    row.boleto_pdf = details["boleto_pdf"] or row.boleto_pdf
+    row.raw_json = json.dumps(payload, ensure_ascii=False, default=str)
+    row.updated_at = datetime.utcnow()
+
+    if pagbank_paid_status(row.status):
+        row.paid_at = row.paid_at or datetime.utcnow()
+        if row.receivable_id:
+            receivable = db.get(Receivable, row.receivable_id)
+            if receivable:
+                receivable.status = "RECEBIDO"
+                receivable.received_date = date.today()
+    db.commit()
+    return _pagbank_payment_payload(row)
+
+
+@app.post("/api/pagbank/webhook")
+async def pagbank_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    payload = await request.json()
+    order_id = str(payload.get("id") or payload.get("order_id") or "")
+    row = None
+    if order_id:
+        row = db.query(PagBankPayment).filter(
+            PagBankPayment.order_id == order_id
+        ).first()
+
+    log = PagBankWebhookLog(
+        tenant_id=row.tenant_id if row else None,
+        company_id=row.company_id if row else None,
+        order_id=order_id,
+        event_type=str(payload.get("event") or payload.get("status") or ""),
+        payload_json=json.dumps(payload, ensure_ascii=False, default=str),
+    )
+    db.add(log)
+    db.commit()
+
+    if not row:
+        log.message = "Cobrança não localizada; evento registrado."
+        db.commit()
+        return {"ok": True}
+
+    config = db.query(PagBankConfig).filter(
+        PagBankConfig.tenant_id == row.tenant_id,
+        PagBankConfig.company_id == row.company_id,
+    ).first()
+    if not config or not config.token_encrypted:
+        log.message = "Configuração PagBank não localizada."
+        db.commit()
+        return {"ok": True}
+
+    try:
+        verified = pagbank_get_order(
+            config.environment,
+            _decrypt_secret(config.token_encrypted),
+            row.order_id,
+        )
+        details = pagbank_extract_payment_details(verified)
+        row.status = details["status"]
+        row.raw_json = json.dumps(
+            verified,
+            ensure_ascii=False,
+            default=str,
+        )
+        row.updated_at = datetime.utcnow()
+        if pagbank_paid_status(row.status):
+            row.paid_at = row.paid_at or datetime.utcnow()
+            if row.receivable_id:
+                receivable = db.get(Receivable, row.receivable_id)
+                if receivable:
+                    receivable.status = "RECEBIDO"
+                    receivable.received_date = date.today()
+        log.processed = True
+        log.message = "Evento validado consultando o pedido no PagBank."
+        db.commit()
+    except Exception as exc:
+        log.message = f"Falha ao validar: {str(exc)[:400]}"
+        db.commit()
+
+    return {"ok": True}
+
+
+@app.get("/api/pagbank/summary")
+def pagbank_summary(
+    company_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    rows = db.query(PagBankPayment).filter(
+        PagBankPayment.tenant_id == user.tenant_id,
+        PagBankPayment.company_id == company_id,
+    ).all()
+    paid = [
+        row for row in rows
+        if pagbank_paid_status(row.status)
+    ]
+    pending = [
+        row for row in rows
+        if not pagbank_paid_status(row.status)
+    ]
+    return {
+        "total_received": float(
+            sum((row.amount for row in paid), Decimal("0"))
+        ),
+        "received_count": len(paid),
+        "pending_value": float(
+            sum((row.amount for row in pending), Decimal("0"))
+        ),
+        "pending_count": len(pending),
+        "pix_count": sum(1 for row in rows if row.payment_type == "PIX"),
+        "boleto_count": sum(1 for row in rows if row.payment_type == "BOLETO"),
     }
 
 @app.get("/health")

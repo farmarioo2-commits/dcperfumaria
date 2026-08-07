@@ -463,3 +463,57 @@ class BankReconciliationLog(Base):
     status: Mapped[str] = mapped_column(String(30), default="OK")
     message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class PagBankConfig(Base):
+    __tablename__ = "pagbank_configs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True, unique=True)
+    environment: Mapped[str] = mapped_column(String(20), default="SANDBOX")
+    token_encrypted: Mapped[str] = mapped_column(Text, default="")
+    webhook_secret_encrypted: Mapped[str] = mapped_column(Text, default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_test_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_status: Mapped[str] = mapped_column(String(30), default="NAO_CONFIGURADO")
+    last_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PagBankPayment(Base):
+    __tablename__ = "pagbank_payments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(index=True)
+    company_id: Mapped[int] = mapped_column(index=True)
+    receivable_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    reference_id: Mapped[str] = mapped_column(String(120), index=True)
+    order_id: Mapped[str] = mapped_column(String(100), default="", index=True)
+    charge_id: Mapped[str] = mapped_column(String(100), default="", index=True)
+    payment_type: Mapped[str] = mapped_column(String(30), default="PIX")
+    customer_name: Mapped[str] = mapped_column(String(220), default="")
+    customer_email: Mapped[str] = mapped_column(String(220), default="")
+    customer_tax_id: Mapped[str] = mapped_column(String(20), default="")
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    status: Mapped[str] = mapped_column(String(40), default="WAITING")
+    qr_code_text: Mapped[str] = mapped_column(Text, default="")
+    qr_code_link: Mapped[str] = mapped_column(Text, default="")
+    boleto_barcode: Mapped[str] = mapped_column(String(100), default="")
+    boleto_pdf: Mapped[str] = mapped_column(Text, default="")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    raw_json: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PagBankWebhookLog(Base):
+    __tablename__ = "pagbank_webhook_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    company_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    order_id: Mapped[str] = mapped_column(String(100), default="", index=True)
+    event_type: Mapped[str] = mapped_column(String(80), default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="")
+    processed: Mapped[bool] = mapped_column(Boolean, default=False)
+    message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
